@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import errno
+import os
+import pty
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import tty
+from pathlib import Path
+
+HELPER_DIR = Path(__file__).resolve().parent
+if str(HELPER_DIR) not in sys.path:
+    sys.path.insert(0, str(HELPER_DIR))
+
+from ds8_io_names import IONames, load_config
+
+DEFAULT_IGNORES = {
+    "fxt": "**-0.5 10.0-**",
+    "wxt": "**-0.5 4.0-**",
+}
+DEFAULT_WXT_FILES = {
+    "data": "{stem_or_glob}s{source}.pha",
+    "background": "{stem_or_glob}s{source}bk.pha",
+    "rmf": "{stem_or_glob}.rmf",
+    "arf": "{stem_or_glob}s{source}.arf",
+}
+SAFE_XSPEC_TOKEN = re.compile(r"^[A-Za-z0-9_./:+@%=-]+$")
+
+
+class FxtxspecError(Exception):
+    pass
+
+
+@dataclass
+class DatasetSpec:
+    name: str
+    detector: str = ""
+    stem: str = ""
+
+
+@dataclass
+class SpectrumInput:
+    slot: int
+    name: str
+    data: Path
+    background: Path
+    rmf: Path
+    arf: Path
+
+
+def cfg_table(table: dict, key: str) -> dict:
+    value = table.get(key, {})
+    return value if isinstance(value, dict) else {}
+
+
+def cfg_str(table: dict, key: str, default: str) -> str:
+    value = table.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return default
+
+
+def cfg_source(config: dict, default: int = 1) -> int | str:
+    for table_name in ("xspec", "instrument"):
+        value = cfg_table(config, table_name).get("source")
+        if value is not None:
+            return value
+    return default
+
+
+def cfg_list(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if isinstance(item, (str, int))]
+    if isinstance(value, str):
+        return [value]
+    return []
+
+
+def parse_positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
+def profile_from_config(config: dict) -> str:
+    xspec_cfg = cfg_table(config, "xspec")
+    profile = xspec_cfg.get("profile")
+    if isinstance(profile, str) and profile.strip():
+        return profile.strip().lower()
+    instrument = cfg_table(config, "instrument").get("name")
+    if isinstance(instrument, str) and instrument.strip().lower() == "wxt":
+        return "wxt"
+    return "fxt"
+
+
+def xspec_file_templates(profile: str, names: IONames, config: dict) -> dict[str, str]:
+    if profile == "wxt":
+        templates = dict(DEFAULT_WXT_FILES)
+    else:
+        templates = {
+            "data": names.outputs["src_pha"],
+            "background": names.outputs["bkg_pha"],
+            "rmf": names.outputs["rmf"],
+            "arf": names.outputs["arf"],
+        }
+
+    files_cfg = cfg_table(cfg_table(config, "xspec"), "files")
+    aliases = {
+        "src_pha": "data",
+        "bkg_pha": "background",
+        "back": "background",
+        "background": "background",
+        "data": "data",
+        "rmf": "rmf",
+        "arf": "arf",
+    }
+    for key, value in files_cfg.items():
+        if not isinstance(value, str):
+            continue
+        target = aliases.get(str(key))
+        if target is not None:
+            templates[target] = value
+    return templates
+
+
+def has_glob_magic(pattern: str) -> bool:
+    return any(char in pattern for char in "*?[")
+
+
+def unique_sorted(paths: list[Path]) -> list[Path]:
+    return sorted(set(paths), key=lambda path: path.name)
+
+
+def require_one(paths: list[Path], label: str) -> Path:
+    paths = unique_sorted(paths)
+    if not paths:
+        raise FxtxspecError(f"No {label} found.")
+    if len(paths) > 1:
+        rendered = "\n  ".join(path.name for path in paths)
+        raise FxtxspecError(f"Ambiguous {label}; matched:\n  {rendered}")
+    return paths[0]
+
+
+def resolve_pattern(directory: Path, pattern: str, label: str) -> Path:
+    path = Path(pattern).expanduser()
+    if path.is_absolute():
+        if path.is_file():
+            return path.resolve()
+        raise FxtxspecError(f"No {label} found: {path}")
+    if has_glob_magic(pattern):
+        return require_one(list(directory.glob(pattern)), label).resolve()
+    path = (directory / path).resolve()
+    if not path.is_file():
+        raise FxtxspecError(f"No {label} found: {path.name}")
+    return path
+
+
+def format_template(template: str, dataset: DatasetSpec, source: int | str) -> str:
+    context = {
+        "detector": dataset.detector,
+        "stem": dataset.stem,
+        "stem_or_glob": dataset.stem or "*",
+        "source": source,
+        "label": "",
+    }
+    return template.format(**context)
+
+
+def dataset_from_value(value: str, names: IONames, *, force_stem: bool = False) -> DatasetSpec:
+    text = str(value)
+    if not force_stem and text in names.detectors:
+        return DatasetSpec(name=text, detector=text, stem=names.stem_for_detector(text))
+    return DatasetSpec(name=text, stem=text)
+
+
+def configured_datasets(config: dict) -> list[str]:
+    return cfg_list(cfg_table(config, "xspec").get("datasets"))
+
+
+def default_datasets(profile: str, names: IONames, config: dict, source: int | str) -> list[DatasetSpec]:
+    configured = configured_datasets(config)
+    if configured:
+        return [dataset_from_value(value, names) for value in configured]
+    if profile == "wxt" and "detectors" not in config:
+        return [DatasetSpec(name=f"s{source}")]
+    return [DatasetSpec(name=det, detector=det, stem=names.stem_for_detector(det)) for det in names.detector_ids()]
+
+
+def resolve_spectrum_input(
+    directory: Path,
+    templates: dict[str, str],
+    dataset: DatasetSpec,
+    slot: int,
+    source: int | str,
+) -> SpectrumInput:
+    patterns = {key: format_template(template, dataset, source) for key, template in templates.items()}
+    return SpectrumInput(
+        slot=slot,
+        name=dataset.name,
+        data=resolve_pattern(directory, patterns["data"], f"{dataset.name} data PHA"),
+        background=resolve_pattern(directory, patterns["background"], f"{dataset.name} background PHA"),
+        rmf=resolve_pattern(directory, patterns["rmf"], f"{dataset.name} RMF"),
+        arf=resolve_pattern(directory, patterns["arf"], f"{dataset.name} ARF"),
+    )
+
+
+def xspec_token(path: Path) -> str:
+    text = str(path)
+    if SAFE_XSPEC_TOKEN.fullmatch(text):
+        return text
+    return '"' + text.replace('"', r"\"") + '"'
+
+
+def format_ignore(inputs: list[SpectrumInput], ignore: str) -> str:
+    ranges = " ".join(f"{item.slot}:{ignore}" for item in inputs)
+    return f"ignore {ranges}"
+
+
+def build_commands(inputs: list[SpectrumInput], ignore: str, statistic: str) -> list[str]:
+    data_args = " ".join(f"{item.slot}:{item.slot} {xspec_token(item.data)}" for item in inputs)
+    commands = [f"data {data_args}"]
+    commands.extend(f"resp {item.slot} {xspec_token(item.rmf)}" for item in inputs)
+    commands.extend(f"arf {item.slot} {xspec_token(item.arf)}" for item in inputs)
+    commands.extend(f"back {item.slot} {xspec_token(item.background)}" for item in inputs)
+    commands.extend(
+        [
+            "setpl en",
+            "ignore bad",
+            format_ignore(inputs, ignore),
+            "cpd /xw",
+            f"statistic {statistic}",
+            "pl ld",
+        ]
+    )
+    return commands
+
+
+def xcm_output_path(directory: Path, min_counts: int | None) -> Path:
+    suffix = f"-g{min_counts}" if min_counts is not None else ""
+    return directory / f"load{suffix}.xcm"
+
+
+def write_xcm(path: Path, commands: list[str]) -> None:
+    try:
+        path.write_text("\n".join(commands) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise FxtxspecError(f"failed to write XSPEC command file {path}: {exc}") from exc
+
+
+def grouped_output_path(data: Path, min_counts: int) -> Path:
+    return data.with_name(f"{data.stem}-g{min_counts}{data.suffix}")
+
+
+def run_rebin(data: Path, min_counts: int) -> Path:
+    rebinned = grouped_output_path(data, min_counts)
+    result = subprocess.run(
+        ["grppha", str(data), f"!{rebinned}", f"comm=group min {min_counts} & exit", "chatter=5"],
+        cwd=data.parent,
+    )
+    if result.returncode != 0:
+        raise FxtxspecError(f"grppha failed with return code {result.returncode}")
+    if not rebinned.is_file():
+        raise FxtxspecError(f"grppha completed but output was not found: {rebinned}")
+    return rebinned
+
+
+def set_child_window_size(master_fd: int, stdin_fd: int) -> None:
+    try:
+        size = termios.tcgetwinsize(stdin_fd)
+        termios.tcsetwinsize(master_fd, size)
+    except (AttributeError, OSError, termios.error):
+        pass
+
+
+def interact_with_child(pid: int, master_fd: int) -> int:
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    old_stdin_attrs = termios.tcgetattr(stdin_fd)
+    old_sigwinch = signal.getsignal(signal.SIGWINCH)
+
+    def on_sigwinch(signum, frame) -> None:  # noqa: ARG001
+        set_child_window_size(master_fd, stdin_fd)
+
+    signal.signal(signal.SIGWINCH, on_sigwinch)
+    set_child_window_size(master_fd, stdin_fd)
+
+    try:
+        tty.setraw(stdin_fd)
+        while True:
+            try:
+                readable, _, _ = select.select([stdin_fd, master_fd], [], [])
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                raise
+
+            if master_fd in readable:
+                try:
+                    data = os.read(master_fd, 4096)
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        break
+                    raise
+                if not data:
+                    break
+                os.write(stdout_fd, data)
+
+            if stdin_fd in readable:
+                data = os.read(stdin_fd, 1024)
+                if not data:
+                    break
+                os.write(master_fd, data)
+    finally:
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_stdin_attrs)
+        signal.signal(signal.SIGWINCH, old_sigwinch)
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+    try:
+        _, status = os.waitpid(pid, 0)
+    except ChildProcessError:
+        return 0
+    return os.waitstatus_to_exitcode(status)
+
+
+def launch_xspec(xspec: str, directory: Path, xcm_path: Path) -> int:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise FxtxspecError("Interactive XSPEC launch requires a terminal.")
+
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        os.chdir(directory)
+        os.execvp(xspec, [xspec])
+
+    payload = f"@{xspec_token(xcm_path)}\n"
+    os.write(master_fd, payload.encode())
+    return interact_with_child(pid, master_fd)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config")
+    pre_args, _ = pre.parse_known_args(argv)
+    config = load_config(pre_args.config, warn=lambda msg: print(f"[xspec_init] {msg}", file=sys.stderr))
+    names = IONames.from_config(config)
+    profile = profile_from_config(config)
+    xspec_cfg = cfg_table(config, "xspec")
+    source = cfg_source(config, 1)
+    ignore = cfg_str(xspec_cfg, "ignore", DEFAULT_IGNORES.get(profile, DEFAULT_IGNORES["fxt"]))
+    statistic = cfg_str(xspec_cfg, "statistic", "cstat")
+
+    parser = argparse.ArgumentParser(
+        description="Open XSPEC for configured EP products and preload data, backgrounds, RMFs, ARFs, and plotting setup.",
+    )
+    parser.add_argument(
+        "--config",
+        default=pre_args.config,
+        help="Path to the ds8 TOML config (explicit; no fixed-location search is performed)",
+    )
+    parser.add_argument(
+        "directory",
+        nargs="?",
+        default=".",
+        help="Product directory (default: current directory)",
+    )
+    parser.add_argument("--profile", choices=("fxt", "wxt"), default=profile, help=f"Built-in product profile (default: {profile})")
+    parser.add_argument("--dataset", action="append", help="Detector id or stem to load; may be repeated")
+    parser.add_argument("--stem", action="append", help="Load a product stem; may be repeated")
+    parser.add_argument("--stem-a", help="Compatibility alias for an FXTA stem")
+    parser.add_argument("--stem-b", help="Compatibility alias for an FXTB stem")
+    parser.add_argument("--data", help="Explicit source PHA path for a single dataset")
+    parser.add_argument("--background", "--back", dest="background", help="Explicit background PHA path for a single dataset")
+    parser.add_argument("--rmf", help="Explicit RMF path for a single dataset")
+    parser.add_argument("--arf", help="Explicit ARF path for a single dataset")
+    parser.add_argument("--source", default=source, help=f"Source index for templates using {{source}} (default: {source})")
+    parser.add_argument(
+        "-r",
+        "--rebin",
+        type=parse_positive_int,
+        metavar="MINCTS",
+        help="run grppha first for source spectra and load the generated -gMINCTS.pha files",
+    )
+    parser.add_argument("--ignore", default=ignore, help=f"XSPEC ignore range (default: {ignore})")
+    parser.add_argument("--statistic", default=statistic, help=f"XSPEC statistic command value (default: {statistic})")
+    parser.add_argument("--dry-run", action="store_true", help="print selected files and XSPEC commands without launching XSPEC")
+    args = parser.parse_args(argv)
+    args.config_data = config
+    args.names = names
+    return args
+
+
+def requested_datasets(args: argparse.Namespace) -> list[DatasetSpec]:
+    if args.dataset:
+        return [dataset_from_value(value, args.names) for value in args.dataset]
+    if args.stem:
+        return [dataset_from_value(value, args.names, force_stem=True) for value in args.stem]
+    if args.stem_a or args.stem_b:
+        stems = [stem for stem in (args.stem_a, args.stem_b) if stem]
+        return [dataset_from_value(stem, args.names, force_stem=True) for stem in stems]
+    return default_datasets(args.profile, args.names, args.config_data, args.source)
+
+
+def direct_input(directory: Path, args: argparse.Namespace) -> SpectrumInput | None:
+    explicit = {
+        "data": args.data,
+        "background": args.background,
+        "rmf": args.rmf,
+        "arf": args.arf,
+    }
+    if not any(explicit.values()):
+        return None
+    missing = [key for key, value in explicit.items() if not value]
+    if missing:
+        names = ", ".join(missing)
+        raise FxtxspecError(f"explicit XSPEC input is incomplete; missing: {names}")
+    return SpectrumInput(
+        slot=1,
+        name="direct",
+        data=resolve_pattern(directory, args.data, "explicit data PHA"),
+        background=resolve_pattern(directory, args.background, "explicit background PHA"),
+        rmf=resolve_pattern(directory, args.rmf, "explicit RMF"),
+        arf=resolve_pattern(directory, args.arf, "explicit ARF"),
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    directory = Path(args.directory).expanduser().resolve()
+    if not directory.is_dir():
+        print(f"Error: directory not found: {directory}", file=sys.stderr)
+        return 1
+
+    try:
+        item = direct_input(directory, args)
+        if item is not None:
+            inputs = [item]
+        else:
+            templates = xspec_file_templates(args.profile, args.names, args.config_data)
+            datasets = requested_datasets(args)
+            if not datasets:
+                raise FxtxspecError("no datasets configured; use --dataset/--stem or [xspec].datasets")
+            inputs = [
+                resolve_spectrum_input(directory, templates, dataset, slot, args.source)
+                for slot, dataset in enumerate(datasets, 1)
+            ]
+
+        rebin_commands: list[str] = []
+        if args.rebin is not None:
+            for item in inputs:
+                rebinned = grouped_output_path(item.data, args.rebin)
+                rebin_commands.append(f"grppha {item.data} !{rebinned} comm='group min {args.rebin} & exit'")
+                if not args.dry_run:
+                    item.data = run_rebin(item.data, args.rebin)
+                else:
+                    item.data = rebinned
+
+        commands = build_commands(inputs, args.ignore, args.statistic)
+        xcm_path = xcm_output_path(directory, args.rebin)
+        if not args.dry_run:
+            write_xcm(xcm_path, commands)
+    except FxtxspecError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Directory: {directory}")
+    print(f"Profile: {args.profile}")
+    print(f"Source: {args.source}")
+    for item in inputs:
+        print(f"Dataset {item.slot}: {item.name}")
+        print(f"Data {item.slot}: {item.data.name}")
+        print(f"Background {item.slot}: {item.background.name}")
+        print(f"RMF {item.slot}: {item.rmf.name}")
+        print(f"ARF {item.slot}: {item.arf.name}")
+    for command in rebin_commands:
+        print(f"Rebin: {command}")
+    xcm_status = "not written" if args.dry_run else "written"
+    print(f"XCM ({xcm_status}): {xcm_path.name}")
+    print("XSPEC commands:")
+    for command in commands:
+        print(f"  {command}")
+
+    if args.dry_run:
+        return 0
+
+    xspec = shutil.which("xspec")
+    if xspec is None:
+        print("Error: xspec not found in PATH.", file=sys.stderr)
+        return 1
+
+    print(f"Launching XSPEC with @{xcm_path.name}...", flush=True)
+    try:
+        return launch_xspec(xspec, directory, xcm_path)
+    except FxtxspecError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,76 @@
+# ds8 FXT configuration (distribution template)
+#
+# Copied into a work directory automatically when you run:
+#   ds8 --inst fxt /path/to/work
+# and that directory has no ds8*.toml yet. Edit the copy per observation.
+
+[instrument]
+name = "fxt"
+
+[heasoft]
+# How ds8 reaches the fxtsoft/HEASOFT tools.
+#   "headas" (default): use the $HEADAS from `source .../headas-init.sh`;
+#                       xselect / xspec / fxt* are found on PATH. No Modules needed.
+#   "module":           load them through Environment Modules instead -- set
+#                       mode = "module" and fill in the two lines below
+#                       (modules_init path is machine-specific; see README).
+mode = "headas"
+# module = "heasoft/fxt1.30"
+# modules_init = "/opt/homebrew/opt/modules/init/profile.sh"
+
+[inputs]
+event = "fxt_{detector}_*_po_cl_*.fits"
+mkf = "fxt_*_mkf_*.fits"
+
+[detectors]
+default = "b"
+
+[detectors.a]
+stem = "1fxta"
+event = "fxt_a_*_po_cl_*.fits"
+label = "FXTA"
+
+[detectors.b]
+stem = "1fxtb"
+event = "fxt_b_*_po_cl_*.fits"
+label = "FXTB"
+
+[extraction]
+energy_filter = true
+pha_min = 38
+pha_max = 925
+
+[response_files]
+mode = "generate"
+
+[outputs]
+products = ["src_pha", "bkg_pha", "rmf", "expo", "arf"]
+
+frame_png = "{stem}-frame-interactive.png"
+
+src_pha = "{stem}-src.pha"
+bkg_pha = "{stem}-bkg.pha"
+rmf = "{stem}.rmf"
+expo = "{stem}-expo.fits"
+arf = "{stem}-src.arf"
+
+src_pha_interval = "{stem}-{label}-src.pha"
+bkg_pha_interval = "{stem}-{label}-bkg.pha"
+rmf_interval = "{stem}-{label}.rmf"
+expo_interval = "{stem}-{label}-expo.fits"
+arf_interval = "{stem}-{label}-src.arf"
+
+lc_workdir = "{stem}-lc"
+spec_workdir = "{stem}-spec"
+
+[xspec]
+profile = "fxt"
+datasets = ["a", "b"]
+ignore = "**-0.5 10.0-**"
+statistic = "cstat"
+
+[xspec.files]
+data = "{stem}-src.pha"
+background = "{stem}-bkg.pha"
+rmf = "{stem}.rmf"
+arf = "{stem}-src.arf"

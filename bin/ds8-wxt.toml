@@ -1,0 +1,76 @@
+# ds8 WXT configuration (distribution template)
+#
+# Copied into a work directory automatically when you run:
+#   ds8 --inst wxt /path/to/work
+# and that directory has no ds8*.toml yet. Edit the copy per observation
+# (e.g. if the source index or product name patterns differ).
+
+[instrument]
+name = "wxt"
+source = 1
+
+[heasoft]
+# How ds8 reaches the fxtsoft/HEASOFT tools.
+#   "headas" (default): use the $HEADAS from `source .../headas-init.sh`;
+#                       xselect / xspec / fxt* are found on PATH. No Modules needed.
+#   "module":           load them through Environment Modules instead -- set
+#                       mode = "module" and fill in the two lines below
+#                       (modules_init path is machine-specific; see README).
+mode = "headas"
+# module = "heasoft/fxt1.30"
+# modules_init = "/opt/homebrew/opt/modules/init/profile.sh"
+
+[inputs]
+event = "ep*wxt*po_cl.evt"
+mkf = "ep*wxt*.mkf"
+rmf = "ep*wxt*.rmf"
+expo = "ep*wxt*.exp"
+arf = "ep*wxt*s{source}.arf"
+
+[detectors]
+default = "auto"
+
+[detectors.wxt]
+stem = "wxt"
+event = "ep*wxt*po_cl.evt"
+label = "WXT"
+
+[extraction]
+energy_filter = false
+
+[viewer]
+# Display-only bin factor for the interactive image (does not affect the
+# extracted products). WXT has a large field of view, so 16 keeps rendering
+# responsive; lower it (e.g. 8) for finer region placement on small fields.
+spatial_bin = 16
+drag_region_body = true
+
+[response_files]
+mode = "existing"
+
+[outputs]
+products = ["src_pha", "bkg_pha"]
+
+frame_png = "{stem}-frame-interactive.png"
+
+# WXT outputs only cover products extracted by this program. RMF/ARF stay in
+# [inputs] and are passed to XSPEC from their original location.
+src_pha = "{stem}-src.pha"
+bkg_pha = "{stem}-bkg.pha"
+src_pha_interval = "{stem}-{label}-src.pha"
+bkg_pha_interval = "{stem}-{label}-bkg.pha"
+
+lc_workdir = "{stem}-lc"
+spec_workdir = "{stem}-spec"
+
+[xspec]
+profile = "wxt"
+source = 1
+ignore = "**-0.5 4.0-**"
+statistic = "cstat"
+
+[xspec.files]
+data = "ep*wxt*s{source}.pha"
+background = "ep*wxt*s{source}bk.pha"
+rmf = "ep*wxt*.rmf"
+arf = "ep*wxt*s{source}.arf"

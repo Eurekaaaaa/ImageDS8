@@ -1,0 +1,3638 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import atexit
+import argparse
+import math
+import os
+from pathlib import Path
+import signal
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+os.environ["DS8_FRAME_PLOT_INTERACTIVE"] = "1"
+
+
+def temp_cache_dir(name: str) -> str:
+    path = Path(tempfile.gettempdir()) / "ds8-frame-plot" / name
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+if "MPLCONFIGDIR" not in os.environ:
+    os.environ["MPLCONFIGDIR"] = temp_cache_dir("matplotlib")
+if "XDG_CACHE_HOME" not in os.environ:
+    os.environ["XDG_CACHE_HOME"] = temp_cache_dir("cache")
+
+HELPER_DIR = Path(__file__).resolve().parent
+if str(HELPER_DIR) not in sys.path:
+    sys.path.insert(0, str(HELPER_DIR))
+
+import matplotlib.pyplot as plt
+import numpy as np
+import astropy.units as u
+from astropy.io import fits
+from matplotlib.lines import Line2D
+from matplotlib.patches import Circle, Rectangle
+from matplotlib.text import Text
+from matplotlib.widgets import SpanSelector
+
+from ds8_frame_plot import (
+    PixelAnnulus,
+    PixelCircle,
+    add_main_axes_frame,
+    apply_ds9_axes_style,
+    configure_wcs_axes,
+    display_limits_for,
+    draw_region,
+    load_frame,
+    log_norm_for,
+    parse_region_file,
+    region_to_pixel,
+    region_to_pixel_circle,
+    resolve_cmap,
+    square_window_inside_frame,
+)
+from ds8_io_names import IONames, load_config
+
+
+
+# Hard-coded feature switch. When True, dragging/resizing a region re-extracts the light
+# curve live in a background thread (writing a watch file that the light-curve window
+# polls). When False (default), the light curve is only (re)extracted when you press 'e';
+# dragging just invalidates the current products. The live-refresh code path below is kept
+# fully intact and is reactivated simply by flipping this back to True.
+LIVE_LC_REFRESH = False
+WORK_SRC_REGION_NAME = "ds8-src.reg"
+WORK_BKG_REGION_NAME = "ds8-bkg.reg"
+
+
+_HINTS: str = ""
+_CLR = "\033[38;5;109m"
+_WARN = "\033[33m"
+_RESET = "\033[0m"
+_BOLD = "\033[1m"
+_RED = "\033[31m"
+_BAR_STYLE = "\033[48;5;236m\033[38;5;230m"
+_BAR_ACTIVE = False
+_BAR_EXIT_REGISTERED = False
+_BAR_SUSPENDED = False
+_COMPACT_HINTS = {
+    "e=LC/spec  x=XSPEC  c=centroid  b=auto-bkg  tab=type  z=zoom  s=save  r=reset  q=quit":
+        "e LC/spec  x XSPEC  c ctr  b bkg  tab type  z zoom  s save  r reset  q quit",
+    "=/- 1s  ctrl+/- 10s  cmd+/- 100s  |  g=GTI  drag=select  enter=extract  u=undo  esc=clear":
+        "+/-1s  ctrl10s  cmd100s  g GTI  drag select  enter extract  u undo  esc clear",
+}
+
+
+def set_terminal_hints(hints: str) -> None:
+    global _HINTS
+    _HINTS = hints
+    _draw_hint_bar()
+
+
+def suspend_terminal_hints() -> None:
+    global _BAR_SUSPENDED
+    _BAR_SUSPENDED = True
+    _clear_hint_bar()
+
+
+def resume_terminal_hints() -> None:
+    global _BAR_SUSPENDED
+    _BAR_SUSPENDED = False
+    _draw_hint_bar()
+
+
+def _term_size() -> os.terminal_size:
+    try:
+        return os.get_terminal_size()
+    except (ValueError, OSError):
+        return os.terminal_size((80, 24))
+
+
+def _term_width() -> int:
+    return _term_size().columns
+
+
+def _format_hint_bar(width: int) -> str:
+    text = f" FXTXSEL2 | {_HINTS} "
+    if len(text) > width:
+        compact = _COMPACT_HINTS.get(_HINTS, _HINTS.replace("=", " "))
+        text = f" FXTXSEL2 | {compact} "
+        if len(text) > width:
+            text = f" {compact} "
+    if len(text) > width:
+        text = text[:width]
+    else:
+        text = text + (" " * (width - len(text)))
+    return f"{_BAR_STYLE}{text}{_RESET}"
+
+
+def _draw_hint_bar() -> None:
+    global _BAR_ACTIVE, _BAR_EXIT_REGISTERED
+    if _BAR_SUSPENDED or not _HINTS or not sys.stdout.isatty():
+        return
+    size = _term_size()
+    if size.lines < 3:
+        return
+    scroll_bottom = size.lines - 1
+    first_draw = not _BAR_ACTIVE
+    try:
+        if not first_draw:
+            sys.stdout.write("\033[s")
+        sys.stdout.write(f"\033[1;{scroll_bottom}r")
+        sys.stdout.write(f"\033[{size.lines};1H")
+        sys.stdout.write("\033[2K")
+        sys.stdout.write(_format_hint_bar(size.columns))
+        if first_draw:
+            sys.stdout.write(f"\033[{scroll_bottom};1H")
+        else:
+            sys.stdout.write("\033[u")
+        sys.stdout.flush()
+    except Exception:
+        return
+    _BAR_ACTIVE = True
+    if not _BAR_EXIT_REGISTERED:
+        atexit.register(_clear_hint_bar)
+        _BAR_EXIT_REGISTERED = True
+
+
+def _clear_hint_bar() -> None:
+    global _BAR_ACTIVE
+    if not _BAR_ACTIVE:
+        return
+    try:
+        sys.stdout.write("\033[r")
+        sys.stdout.write(f"\033[{_term_size().lines};1H")
+        sys.stdout.write("\033[2K")
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
+    _BAR_ACTIVE = False
+
+
+def _rel(path) -> str:
+    try:
+        return str(Path(path).resolve().relative_to(Path.cwd()))
+    except (ValueError, TypeError):
+        return str(path)
+
+
+def _print_bar(stream=None) -> None:
+    if stream is None:
+        stream = sys.stdout
+    w = _term_width()
+    print(f"{_CLR}{'─' * w}{_RESET}", file=stream)
+
+
+def terminal_line(message: str = "", *, stream=None) -> None:
+    if stream is None:
+        stream = sys.stdout
+    _draw_hint_bar()
+    print(f"  {message}", file=stream)
+    _draw_hint_bar()
+
+
+def terminal_block(
+    title: str,
+    rows: list[tuple[str, object]] | tuple[tuple[str, object], ...] = (),
+    notes: list[str] | tuple[str, ...] = (),
+    *,
+    stream=None,
+) -> None:
+    if stream is None:
+        stream = sys.stdout
+    _draw_hint_bar()
+    _print_bar(stream)
+    label_w = max((len(label) for label, _ in rows), default=0) if rows else 0
+    label_w = max(label_w, 6)
+    print(f"  {_BOLD}{title}{_RESET}", file=stream)
+    for label, value in rows:
+        value_str = _rel(value) if isinstance(value, Path) else str(value)
+        print(f"  {_CLR}{label:<{label_w}}{_RESET}  {value_str}", file=stream)
+    for note in notes:
+        print(f"  {_CLR}{note}{_RESET}", file=stream)
+    _draw_hint_bar()
+
+
+def terminal_warning(message: str, rows: list[tuple[str, object]] | tuple[tuple[str, object], ...] = ()) -> None:
+    stream = sys.stderr
+    _draw_hint_bar()
+    _print_bar(stream)
+    print(f"  {_WARN}{_BOLD}warning{_RESET}  {message}", file=stream)
+    if rows:
+        label_w = max((len(label) for label, _ in rows), default=0)
+        label_w = max(label_w, 6)
+        for label, value in rows:
+            value_str = _rel(value) if isinstance(value, Path) else str(value)
+            print(f"  {_CLR}{label:<{label_w}}{_RESET}  {value_str}", file=stream)
+    _draw_hint_bar()
+
+
+def terminal_error(message: str, rows: list[tuple[str, object]] | tuple[tuple[str, object], ...] = ()) -> None:
+    stream = sys.stderr
+    _draw_hint_bar()
+    _print_bar(stream)
+    print(f"  {_RED}{_BOLD}error{_RESET}  {message}", file=stream)
+    if rows:
+        label_w = max((len(label) for label, _ in rows), default=0)
+        label_w = max(label_w, 6)
+        for label, value in rows:
+            value_str = _rel(value) if isinstance(value, Path) else str(value)
+            print(f"  {_CLR}{label:<{label_w}}{_RESET}  {value_str}", file=stream)
+    _draw_hint_bar()
+
+
+# --- HEASOFT invocation -------------------------------------------------------
+# How run_heasoft_command / the XSPEC launcher make the HEASOFT (fxtsoft) tools
+# available. Resolved once from the config/CLI in main() and read by the two exec
+# sites. Kept as a module-level setting because it is fixed for the whole run and
+# must be re-derived identically in the forked light-curve subprocess.
+#   "headas": use the environment's $HEADAS (default). Errors if $HEADAS is unset.
+#   "module": load HEASOFT through Environment Modules instead.
+HEASOFT_MODE = "headas"
+
+DEFAULT_HEASOFT_MODULE = "heasoft/fxt1.20.1d"
+DEFAULT_MODULES_INIT = "/opt/homebrew/opt/modules/init/profile.sh"
+INSTRUMENT_NAME = "fxt"
+RESPONSE_FILES_MODE = "generate"
+ENERGY_FILTER = True
+SOURCE_ID: int | str | None = None
+
+# Input-matching globs and output-naming templates. Fixed for the whole run and
+# rebuilt from [inputs]/[outputs] in main() (and in the forked LC subprocess).
+NAMES = IONames.from_config(None)
+
+# Path of the resolved config file, forwarded to LC/XSPEC subprocesses so they
+# resolve the same config.
+CONFIG_PATH: str | None = None
+
+
+def cfg_table(config: dict, key: str) -> dict:
+    value = config.get(key, {})
+    return value if isinstance(value, dict) else {}
+
+
+def cfg_bool(table: dict, key: str, default: bool) -> bool:
+    value = table.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
+def cfg_int(table: dict, key: str, default: int) -> int:
+    value = table.get(key)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
+
+
+def instrument_name_from_config(config: dict) -> str:
+    value = cfg_table(config, "instrument").get("name", "fxt")
+    return str(value).strip().lower() if value is not None else "fxt"
+
+
+def response_files_mode_from_config(config: dict, instrument_name: str) -> str:
+    table = cfg_table(config, "response_files")
+    value = table.get("mode")
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    return "existing" if instrument_name == "wxt" else "generate"
+
+
+def energy_filter_from_config(config: dict, instrument_name: str) -> bool:
+    default = instrument_name != "wxt"
+    return cfg_bool(cfg_table(config, "extraction"), "energy_filter", default)
+
+
+def source_id_from_config(config: dict, instrument_name: str) -> int | str | None:
+    for table_name in ("xspec", "instrument"):
+        value = cfg_table(config, table_name).get("source")
+        if value is not None:
+            return value
+    return 1 if instrument_name == "wxt" else None
+
+
+def spatial_bin_from_config(config: dict, instrument_name: str) -> int:
+    default = 4 if instrument_name == "wxt" else 1
+    return max(1, cfg_int(cfg_table(config, "viewer"), "spatial_bin", default))
+
+
+def drag_region_body_from_config(config: dict, instrument_name: str) -> bool:
+    default = instrument_name == "wxt"
+    return cfg_bool(cfg_table(config, "viewer"), "drag_region_body", default)
+
+
+def config_startup_error(message: str) -> None:
+    terminal_error(message)
+    raise SystemExit(2)
+
+
+def config_work_dir(path_text: str | None) -> Path:
+    path = Path(path_text or ".").expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = path.resolve()
+    if path.is_file():
+        return path.parent
+    return path
+
+
+def template_config_path(inst: str) -> Path:
+    return HELPER_DIR / f"ds8-{inst}.toml"
+
+
+def load_config_strict(path: Path) -> dict:
+    config = load_config(str(path), warn=lambda msg: terminal_warning(msg))
+    if not config.get("_source"):
+        config_startup_error(f"could not load TOML config: {path}")
+    return config
+
+
+def resolve_startup_config(inst: str | None, explicit_config: str | None, path_text: str | None) -> tuple[Path | None, dict]:
+    if explicit_config:
+        path = Path(explicit_config).expanduser().resolve()
+        config = load_config_strict(path)
+        if inst is not None:
+            config_inst = instrument_name_from_config(config)
+            if config_inst != inst:
+                config_startup_error(f"--inst {inst} does not match config instrument {config_inst!r}: {path}")
+        return path, config
+
+    work_dir = config_work_dir(path_text)
+    if not work_dir.is_dir():
+        config_startup_error(f"config directory not found: {work_dir}")
+
+    candidates = sorted(work_dir.glob("ds8*.toml"))
+    if len(candidates) > 1:
+        names = ", ".join(path.name for path in candidates)
+        config_startup_error(f"ambiguous ds8 TOML files in {work_dir}: {names}")
+
+    if candidates:
+        path = candidates[0].resolve()
+        config = load_config_strict(path)
+        config_inst = instrument_name_from_config(config)
+        if inst is not None and config_inst != inst:
+            config_startup_error(f"--inst {inst} does not match config instrument {config_inst!r}: {path}")
+        return path, config
+
+    if inst is None:
+        config_startup_error(f"no ds8 TOML found in {work_dir}; use --inst fxt or --inst wxt to create one")
+
+    template = template_config_path(inst)
+    if not template.is_file():
+        config_startup_error(f"template config not found for --inst {inst}: {template}")
+    target = work_dir / f"ds8-{inst}.toml"
+    shutil.copyfile(template, target)
+    terminal_block("config created", (("path", target), ("instrument", inst)))
+    return target, load_config_strict(target)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    # First resolve --config/--inst/PATH, so the config file can supply defaults below.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config")
+    pre.add_argument("--inst", choices=("fxt", "wxt"))
+    pre.add_argument("path", nargs="?")
+    pre_args, _ = pre.parse_known_args(argv)
+    config_path, config = resolve_startup_config(pre_args.inst, pre_args.config, pre_args.path)
+    names = IONames.from_config(config)
+    heasoft_cfg = cfg_table(config, "heasoft")
+    extraction_cfg = cfg_table(config, "extraction")
+    instrument_name = instrument_name_from_config(config)
+    spatial_bin_default = spatial_bin_from_config(config, instrument_name)
+
+    def cfg_default(env_key: str | None, config_key: str, builtin):
+        # Precedence for a default: environment variable > config file > built-in.
+        # An explicit command-line flag still overrides all of these (argparse).
+        if env_key and os.environ.get(env_key):
+            return os.environ[env_key]
+        value = heasoft_cfg.get(config_key)
+        if value is not None:
+            return value
+        return builtin
+
+    parser = argparse.ArgumentParser(
+        description="Open an interactive EP/FXT frame viewer with draggable source/background handles.",
+    )
+    parser.add_argument(
+        "--config",
+        default=str(config_path) if config_path is not None else None,
+        help="Path to a TOML config file; when omitted, ds8 uses or creates ds8-<inst>.toml in PATH's directory",
+    )
+    parser.add_argument(
+        "--inst",
+        choices=("fxt", "wxt"),
+        default=pre_args.inst or instrument_name,
+        help=f"Instrument profile used to select/create the config file (default: {pre_args.inst or instrument_name})",
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        default=".",
+        help="Project directory or event FITS file (default: current directory)",
+    )
+    parser.add_argument(
+        "--detector",
+        default=names.default_detector,
+        help=f"Detector id to auto-detect when PATH is a directory (default: {names.default_detector})",
+    )
+    parser.add_argument("--src-reg", default="src.reg", help="Source region file (default: src.reg)")
+    parser.add_argument("--bkg-reg", default="bkg.reg", help="Background region file (default: bkg.reg)")
+    parser.add_argument("--output", help="Output PNG used when pressing 's'")
+    parser.add_argument("--main-size", type=float, default=400.0, help="Main panel side length in pixels (default: 400)")
+    parser.add_argument("--zoom-factor", type=float, default=1.2, help="Initial zoom half-width in source radii (default: 1.2)")
+    parser.add_argument("--spatial-bin", type=int, default=spatial_bin_default, help="Spatial bin factor for the viewer image (default: 4 for WXT configs, 1 otherwise)")
+    parser.add_argument("--drag-region-body", action="store_true", default=drag_region_body_from_config(config, instrument_name), help="Allow dragging a region by clicking inside it (default: on for WXT configs)")
+    parser.add_argument("--dpi", type=int, default=300, help="Saved PNG DPI (default: 300)")
+    parser.add_argument("--cmap", default="he", help="Colormap name, or 'he' (default: he)")
+    parser.add_argument("--lc-bin", type=float, default=100.0, help="lcurve rebin time in seconds (default: 100)")
+    parser.add_argument("--pha-min", type=int, default=cfg_int(extraction_cfg, "pha_min", 38), help="Minimum PHA channel for light curve extraction (default: 38)")
+    parser.add_argument("--pha-max", type=int, default=cfg_int(extraction_cfg, "pha_max", 925), help="Maximum PHA channel for light curve extraction (default: 925)")
+    parser.add_argument("--mkf", help="MKF FITS file for spectrum extraction (default: auto-detect)")
+    parser.add_argument("--psfcor", type=float, default=1.0, help="fxtarfgen psfcor value (default: 1)")
+    parser.add_argument(
+        "--extract-dir",
+        default=".ds8_extract",
+        help="Directory for temporary extraction products (default: .ds8_extract)",
+    )
+    parser.add_argument(
+        "--heasoft-mode",
+        choices=("headas", "module"),
+        default=cfg_default("DS8_HEASOFT_MODE", "mode", "headas"),
+        help="How to reach HEASOFT/fxtsoft tools: 'headas' uses the environment's $HEADAS (default), 'module' loads via Environment Modules",
+    )
+    parser.add_argument(
+        "--module",
+        default=cfg_default("HEASOFT_MODULE", "module", DEFAULT_HEASOFT_MODULE),
+        help="HEASOFT module to load when --heasoft-mode=module",
+    )
+    parser.add_argument(
+        "--modules-init",
+        default=cfg_default("MODULES_INIT", "modules_init", DEFAULT_MODULES_INIT),
+        help="Environment Modules init file used when --heasoft-mode=module",
+    )
+    parser.add_argument("--plot-lc", help=argparse.SUPPRESS)
+    parser.add_argument("--plot-title", default="Corrected light curve", help=argparse.SUPPRESS)
+    parser.add_argument("--watch-lc", help=argparse.SUPPRESS)
+    parser.add_argument("--lc-eventfile", help=argparse.SUPPRESS)
+    parser.add_argument("--lc-project-dir", help=argparse.SUPPRESS)
+    parser.add_argument("--lc-mkf", help=argparse.SUPPRESS)
+    parser.add_argument("--dry-run", action="store_true", help="Print selected files and initial limits without opening a window")
+    args = parser.parse_args(argv)
+    args._config = config  # full config tables, used to build IONames in main()
+    return args
+
+
+def find_one(directory: Path, pattern: str, label: str) -> Path:
+    matches = sorted(directory.glob(pattern))
+    if not matches:
+        raise FileNotFoundError(f"No {label} found with pattern {pattern!r} in {directory}")
+    if len(matches) > 1:
+        names = ", ".join(path.name for path in matches)
+        raise RuntimeError(f"Ambiguous {label}; matched: {names}")
+    return matches[0]
+
+
+def resolve_event_file(path_arg: str, detector: str | None) -> tuple[Path, Path]:
+    path = Path(path_arg).expanduser().resolve()
+    if path.is_file():
+        return path, path.parent
+    if not path.is_dir():
+        raise FileNotFoundError(f"Path not found: {path}")
+
+    if detector and detector.lower() != "auto":
+        pattern = NAMES.event_pattern(detector)
+        label = f"{NAMES.detector_label(detector)} event file"
+        return find_one(path, pattern, label), path
+
+    matches: list[tuple[str, Path]] = []
+    for det in NAMES.detector_ids():
+        for candidate in sorted(path.glob(NAMES.event_pattern(det))):
+            matches.append((det, candidate))
+    unique: dict[Path, str] = {}
+    for det, candidate in matches:
+        unique.setdefault(candidate, det)
+    if not unique:
+        patterns = ", ".join(NAMES.event_pattern(det) for det in NAMES.detector_ids())
+        raise FileNotFoundError(f"No event file found with configured patterns in {path}: {patterns}")
+    if len(unique) > 1:
+        names = ", ".join(candidate.name for candidate in sorted(unique))
+        raise RuntimeError(f"Ambiguous event file; matched: {names}")
+    return next(iter(unique)), path
+
+
+def resolve_region(path_text: str, project_dir: Path) -> Path:
+    path = Path(path_text).expanduser()
+    if not path.is_absolute():
+        path = project_dir / path
+    return path.resolve()
+
+
+def resolve_optional_mkf(path_text: str | None, project_dir: Path) -> Path | None:
+    if not path_text:
+        return None
+    path = Path(path_text).expanduser()
+    if not path.is_absolute():
+        path = project_dir / path
+    return path.resolve()
+
+
+def resolve_mkf_file(path_text: str | None, project_dir: Path, eventfile: Path | None = None) -> Path:
+    path = resolve_optional_mkf(path_text, project_dir)
+    if path is None:
+        path = find_one(project_dir, NAMES.mkf_pattern(eventfile), "MKF file").resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"MKF file not found: {path}")
+    return path
+
+
+def has_glob_magic(pattern: str) -> bool:
+    return any(char in pattern for char in "*?[")
+
+
+def resolve_input_product(
+    project_dir: Path,
+    eventfile: Path,
+    key: str,
+    *,
+    label: str | None = None,
+    source: int | str | None = None,
+    required: bool = True,
+) -> Path | None:
+    pattern = NAMES.input_pattern_for_event(key, eventfile, label=label, source=source)
+    path = Path(pattern).expanduser()
+    if path.is_absolute():
+        if path.is_file():
+            return path.resolve()
+        if required:
+            raise FileNotFoundError(f"{key.upper()} file not found: {path}")
+        return None
+    if has_glob_magic(pattern):
+        try:
+            return find_one(project_dir, pattern, f"{key.upper()} file").resolve()
+        except FileNotFoundError:
+            if required:
+                raise
+            return None
+    path = (project_dir / path).resolve()
+    if path.is_file():
+        return path
+    if required:
+        raise FileNotFoundError(f"{key.upper()} file not found: {path}")
+    return None
+
+
+def existing_response_files(
+    project_dir: Path,
+    eventfile: Path,
+    *,
+    label: str | None = None,
+) -> dict[str, Path]:
+    products = {
+        "rmf": resolve_input_product(project_dir, eventfile, "rmf", label=label, source=SOURCE_ID, required=True),
+        "arf": resolve_input_product(project_dir, eventfile, "arf", label=label, source=SOURCE_ID, required=True),
+    }
+    expo = resolve_input_product(project_dir, eventfile, "expo", label=label, source=SOURCE_ID, required=False)
+    if expo is not None:
+        products["expo"] = expo
+    return products
+
+
+def default_output_path(eventfile: Path, project_dir: Path) -> Path:
+    return project_dir / NAMES.frame_png_name(eventfile)
+
+
+def default_stem_for_event(eventfile: Path) -> str:
+    return NAMES.stem_for_event(eventfile)
+
+
+def clamp_center(x: float, y: float, radius: float, counts) -> tuple[float, float]:
+    return (
+        min(max(x, -0.5 + radius), counts.shape[1] - 0.5 - radius),
+        min(max(y, -0.5 + radius), counts.shape[0] - 0.5 - radius),
+    )
+
+
+def _box_sum(image: np.ndarray, h: int) -> np.ndarray:
+    k = 2 * h + 1
+    ny, nx = image.shape
+    padded = np.zeros((ny + 2 * h, nx + 2 * h), dtype=float)
+    padded[h : h + ny, h : h + nx] = image
+    sat = np.zeros((ny + 2 * h + 1, nx + 2 * h + 1), dtype=float)
+    sat[1:, 1:] = np.cumsum(np.cumsum(padded, axis=0), axis=1)
+    return sat[k:, k:][:ny, :nx] - sat[:ny, k:][:ny, :nx] - sat[k:, :nx][:ny, :nx] + sat[:ny, :nx]
+
+
+def auto_background_candidates(
+    counts: np.ndarray,
+    src_x: float,
+    src_y: float,
+    src_radius: float,
+    bkg_radius: float,
+    *,
+    n_angles: int = 36,
+    max_distance_factor: float = 6.0,
+    max_candidates: int = 3,
+) -> list[tuple[float, float, float]]:
+    ny, nx = counts.shape
+
+    y_grid, x_grid = np.ogrid[0:ny, 0:nx]
+    dist2 = (x_grid - src_x) ** 2 + (y_grid - src_y) ** 2
+
+    # Local background rate from annulus around source (accounts for vignetting)
+    inner_r = 2.0 * src_radius
+    outer_r = 5.0 * src_radius
+    annulus = (dist2 > inner_r**2) & (dist2 <= outer_r**2) & np.isfinite(counts)
+    if annulus.sum() == 0:
+        raise ValueError("annulus for background estimation has no valid pixels")
+    lambda_0 = float(counts[annulus].mean())
+    thresh = max(3.0, lambda_0 + 5.0 * np.sqrt(max(lambda_0, 0.01)))
+    clean = annulus & (counts <= thresh)
+    lambda_bg = float(counts[clean].mean()) if clean.sum() > 0 else lambda_0
+
+    # Smoothed image for peak detection (source-like concentration finder)
+    detect_h = 5
+    safe_counts = np.where(np.isfinite(counts), counts, 0.0).astype(float)
+    smooth = _box_sum(safe_counts, detect_h)
+    n_detect = (2 * detect_h + 1) ** 2
+    expected_detect = lambda_bg * n_detect
+
+    # Source mask: only the user's source circle with a small buffer
+    source_mask = dist2 <= (src_radius + 5) ** 2
+
+    # Candidate search
+    gap = 2.0
+    min_dist = src_radius + bkg_radius + gap
+    max_dist = min(max_distance_factor * src_radius, 0.2 * min(nx, ny))
+    if max_dist < min_dist:
+        min_dist = src_radius + bkg_radius
+        if max_dist < min_dist:
+            raise ValueError("insufficient room for background circle")
+
+    r_int = int(np.ceil(bkg_radius))
+    yy, xx = np.ogrid[-r_int : r_int + 1, -r_int : r_int + 1]
+    footprint = xx**2 + yy**2 <= bkg_radius**2
+    n_foot = int(footprint.sum())
+    step = max(bkg_radius / 3.0, 3.0)
+    angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+
+    scored: list[tuple[float, float, float]] = []
+    for theta in angles:
+        ct, st = float(np.cos(theta)), float(np.sin(theta))
+        d = min_dist
+        while d <= max_dist:
+            bx = src_x + d * ct
+            by = src_y + d * st
+            if bx - bkg_radius < -0.5 or bx + bkg_radius > nx - 0.5:
+                d += step
+                continue
+            if by - bkg_radius < -0.5 or by + bkg_radius > ny - 0.5:
+                d += step
+                continue
+            ix, iy = int(round(bx)), int(round(by))
+            y0, y1 = iy - r_int, iy + r_int + 1
+            x0, x1 = ix - r_int, ix + r_int + 1
+            y0c, y1c = max(y0, 0), min(y1, ny)
+            x0c, x1c = max(x0, 0), min(x1, nx)
+            fp = footprint[y0c - y0 : y1c - y0, x0c - x0 : x1c - x0]
+            n_cont = int((fp & source_mask[y0c:y1c, x0c:x1c]).sum())
+            if n_cont / max(n_foot, 1) > 0.05:
+                d += step
+                continue
+            observed = float(counts[y0c:y1c, x0c:x1c][fp].sum())
+            expected = lambda_bg * n_foot
+            if expected > 0:
+                z = (observed - expected) / np.sqrt(expected)
+            else:
+                z = 0.0 if observed == 0 else 999.0
+            if z > 3.0:
+                d += step
+                continue
+            # Peak concentration: highest smoothed value inside the circle
+            peak = float(smooth[y0c:y1c, x0c:x1c][fp].max())
+            if expected_detect > 0:
+                z_peak = (peak - expected_detect) / np.sqrt(expected_detect)
+            else:
+                z_peak = 0.0 if peak == 0 else 999.0
+            score = (d / src_radius
+                     + 2.0 * max(0.0, z - 1.0)
+                     + 1.5 * max(0.0, z_peak - 2.0))
+            scored.append((score, bx, by))
+            break
+            d += step  # noqa: unreachable
+
+    if not scored:
+        raise ValueError("no valid background position found")
+    scored.sort()
+    return [(bx, by, s) for s, bx, by in scored[:max_candidates]]
+
+
+def write_region(path: Path, label: str, x: float, y: float, radius: float, wcs, *, inner_radius: float = 0.0) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if wcs is None:
+        raise ValueError("Cannot write fk5 region because the loaded frame has no celestial WCS.")
+    is_annulus = inner_radius > 0
+    center = wcs.pixel_to_world(x, y)
+    outer_edge = wcs.pixel_to_world(x + radius, y)
+    outer_arcsec = center.separation(outer_edge).arcsec
+    if is_annulus:
+        inner_edge = wcs.pixel_to_world(x + inner_radius, y)
+        inner_arcsec = center.separation(inner_edge).arcsec
+        shape = f"annulus({center.ra.deg:.10f},{center.dec.deg:.10f},{inner_arcsec:.6f}\",{outer_arcsec:.6f}\")"
+    else:
+        shape = f"circle({center.ra.deg:.10f},{center.dec.deg:.10f},{outer_arcsec:.6f}\")"
+    path.write_text(
+        "# Region file format: DS9 version 4.1\n"
+        "global color=green width=1\n"
+        "fk5\n"
+        f"{shape} # text={{{label}}}\n"
+    )
+
+
+def run_heasoft_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    stdin_text: str,
+    module_name: str,
+    modules_init: str,
+    isolate_home: bool = True,
+    python_bin_dir: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    runtime_dir = Path(tempfile.gettempdir()) / "ds8-heasoft" / cwd.name[:24]
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    pfiles_dir = runtime_dir / "pfiles"
+    pfiles_dir.mkdir(parents=True, exist_ok=True)
+    original_pfiles = env.get("PFILES", "")
+    if ";" in original_pfiles:
+        env["PFILES"] = f"{pfiles_dir};{original_pfiles.split(';', 1)[1]}"
+    elif original_pfiles:
+        env["PFILES"] = f"{pfiles_dir};{original_pfiles}"
+    else:
+        env["PFILES"] = str(pfiles_dir)
+    if isolate_home:
+        env["HOME"] = str(runtime_dir)
+    if python_bin_dir is not None:
+        env["PATH"] = f"{python_bin_dir}{os.pathsep}{env.get('PATH', '')}"
+
+    if HEASOFT_MODE == "module":
+        init = Path(modules_init).expanduser()
+        if not init.is_file():
+            raise RuntimeError(f"--heasoft-mode=module but the Environment Modules init file was not found: {init}")
+        python_path_setup = ""
+        if python_bin_dir is not None:
+            python_path_setup = (
+                f"export PATH={shlex.quote(str(python_bin_dir))}:$PATH; "
+                'if [ -n "${HEADAS:-}" ]; then export PYTHONPATH="$HEADAS/lib/python:$HEADAS/lib:${PYTHONPATH:-}"; fi; '
+            )
+        shell_command = (
+            f". {shlex.quote(str(init))}; "
+            f"module load {shlex.quote(module_name)}; "
+            f"{python_path_setup}"
+            f"{shlex.join(command)}"
+        )
+        return subprocess.run(
+            ["bash", "-lc", shell_command],
+            cwd=cwd,
+            input=stdin_text,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            env=env,
+        )
+
+    # headas mode (default): rely on the environment's $HEADAS-initialised HEASOFT.
+    if not env.get("HEADAS"):
+        raise RuntimeError(
+            "$HEADAS is not set. Source your fxtsoft headas-init.sh first (so $HEADAS points to fxtsoft "
+            'and its tools are on PATH), or set mode = "module" in the config.'
+        )
+    if shutil.which(command[0], path=env.get("PATH")) is None:
+        raise RuntimeError(
+            f"{command[0]} was not found on PATH under $HEADAS={env['HEADAS']}. "
+            "Ensure $HEADAS points to a fxtsoft installation whose headas-init.sh has been sourced."
+        )
+    return subprocess.run(
+        command,
+        cwd=cwd,
+        input=stdin_text,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        env=env,
+    )
+
+
+def require_success(result: subprocess.CompletedProcess[str], label: str) -> None:
+    if result.returncode == 0:
+        return
+
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    tail = "\n".join(output.splitlines()[-30:])
+    raise RuntimeError(f"{label} failed with return code {result.returncode}.\n{tail}")
+
+
+def time_column_unit(header: fits.Header, names) -> str:
+    if names and "TIME" in names:
+        try:
+            index = list(names).index("TIME") + 1
+            unit = header.get(f"TUNIT{index}")
+            if unit:
+                return str(unit).strip().lower()
+        except ValueError:
+            pass
+    return str(header.get("TIMEUNIT", "s")).strip().lower()
+
+
+def time_unit_to_seconds(unit: str) -> float:
+    unit = unit.strip().lower()
+    if unit.startswith("d"):
+        return 86400.0
+    return 1.0
+
+
+def read_lightcurve(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, str]:
+    with fits.open(path) as hdul:
+        for hdu in hdul:
+            data = hdu.data
+            names = getattr(data, "names", None)
+            if not names or "TIME" not in names:
+                continue
+            rate_name = "RATE1" if "RATE1" in names else "RATE" if "RATE" in names else None
+            if rate_name is None:
+                continue
+            err_name = "ERROR1" if "ERROR1" in names else "ERROR" if "ERROR" in names else None
+            time_values = np.asarray(data["TIME"], dtype=float)
+            rate_values = np.asarray(data[rate_name], dtype=float)
+            err_values = np.asarray(data[err_name], dtype=float) if err_name else None
+            finite = np.isfinite(time_values) & np.isfinite(rate_values)
+            if err_values is not None:
+                finite &= np.isfinite(err_values)
+                err_values = err_values[finite]
+            time_values = time_values[finite]
+            rate_values = rate_values[finite]
+            unit = time_column_unit(hdu.header, names)
+            time_values = (time_values - time_values.min()) * time_unit_to_seconds(unit)
+            return time_values, rate_values, err_values, "s"
+    raise RuntimeError(f"No usable light curve table found in {path}")
+
+
+def _find_time_reference(path: Path) -> tuple[float, fits.Header] | None:
+    with fits.open(path) as hdul:
+        for hdu in hdul:
+            data = hdu.data
+            names = getattr(data, "names", None)
+            if not names or "TIME" not in names:
+                continue
+            rate_name = "RATE1" if "RATE1" in names else "RATE" if "RATE" in names else None
+            if rate_name is None:
+                continue
+            time_values = np.asarray(data["TIME"], dtype=float)
+            rate_values = np.asarray(data[rate_name], dtype=float)
+            finite = np.isfinite(time_values) & np.isfinite(rate_values)
+            err_name = "ERROR1" if "ERROR1" in names else "ERROR" if "ERROR" in names else None
+            if err_name is not None:
+                finite &= np.isfinite(np.asarray(data[err_name], dtype=float))
+            filtered = time_values[finite]
+            if filtered.size == 0:
+                continue
+            scale = time_unit_to_seconds(time_column_unit(hdu.header, names))
+            time_min = float(filtered.min()) * scale
+            if "TIMEZERO" in hdu.header:
+                return float(hdu.header["TIMEZERO"]) + time_min, hdu.header.copy()
+            if "TSTART" in hdu.header:
+                return float(hdu.header["TSTART"]), hdu.header.copy()
+    return None
+
+
+def lightcurve_time_base_seconds(path: Path) -> tuple[float, fits.Header]:
+    result = _find_time_reference(path)
+    if result is not None:
+        return result
+    for fallback_name in ("src-corr.lc", "src.lc"):
+        fallback = path.parent / fallback_name
+        if fallback.is_file() and fallback != path:
+            result = _find_time_reference(fallback)
+            if result is not None:
+                return result
+    raise RuntimeError(f"No usable time reference found in {path}")
+
+
+def write_interval_gti(path: Path, start: float, stop: float, template_header: fits.Header) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    primary = fits.PrimaryHDU()
+    columns = [
+        fits.Column(name="START", format="D", unit="s", array=np.asarray([start], dtype=float)),
+        fits.Column(name="STOP", format="D", unit="s", array=np.asarray([stop], dtype=float)),
+    ]
+    hdu = fits.BinTableHDU.from_columns(columns, name="GTI")
+    for key in ("TIMESYS", "MJDREF", "MJDREFI", "MJDREFF", "TIMEUNIT", "TIMEREF", "TASSIGN", "CLOCKAPP"):
+        if key in template_header:
+            hdu.header[key] = template_header[key]
+            primary.header[key] = template_header[key]
+    hdu.header["TSTART"] = float(start)
+    hdu.header["TSTOP"] = float(stop)
+    hdu.header["TIMEUNIT"] = "s"
+    primary.header["TSTART"] = float(start)
+    primary.header["TSTOP"] = float(stop)
+    primary.header["TIMEUNIT"] = "s"
+    fits.HDUList([primary, hdu]).writeto(path, overwrite=True)
+
+
+def format_lc_bin(lc_bin: float | None) -> str:
+    if lc_bin is None or lc_bin <= 0:
+        return "native"
+    if abs(lc_bin - round(lc_bin)) < 1e-6:
+        return f"{int(round(lc_bin))} s"
+    return f"{lc_bin:g} s"
+
+
+def lc_bin_suffix(lc_bin: float) -> str:
+    text = f"{lc_bin:g}".replace("-", "m").replace(".", "p")
+    return f"{text}s"
+
+
+def corrected_lightcurve_for(path: Path) -> Path:
+    sibling = path.with_name("src-corr.lc")
+    if sibling.is_file():
+        return sibling
+    return path
+
+
+def rebin_lightcurve_for_display(
+    source_path: Path,
+    lc_bin: float,
+    module_name: str,
+    modules_init: str,
+) -> Path:
+    corr_lc = corrected_lightcurve_for(source_path)
+    if lc_bin <= 0:
+        return corr_lc
+    if not corr_lc.is_file():
+        raise FileNotFoundError(f"Corrected light curve not found: {corr_lc}")
+
+    out_lc = corr_lc.with_name(f"{corr_lc.stem}-rebin-{lc_bin_suffix(lc_bin)}.lc")
+    # Keep only the most recent rebin: drop any earlier rebins (different bin suffixes)
+    # before writing the fresh one, so the directory holds a single src-corr-rebin-*.lc.
+    for stale in corr_lc.parent.glob(f"{corr_lc.stem}-rebin-*.lc"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    lcurve_input = "\n".join(["1", str(corr_lc), "-", f"{lc_bin:g}", "INDEF", str(out_lc), "no", ""])
+    result = run_heasoft_command(
+        ["lcurve"],
+        cwd=corr_lc.parent,
+        stdin_text=lcurve_input,
+        module_name=module_name,
+        modules_init=modules_init,
+    )
+    require_success(result, "lcurve")
+    if not out_lc.is_file():
+        raise RuntimeError(f"lcurve completed but output was not created: {out_lc}")
+    return out_lc
+
+
+def _parse_modifiers(text: str) -> set[str]:
+    lowered = text.lower().replace("+", " ").replace("|", " ").replace(",", " ")
+    tokens: set[str] = set()
+    if "shift" in lowered:
+        tokens.add("shift")
+    if "cmd" in lowered or "command" in lowered or "super" in lowered or "meta" in lowered:
+        tokens.add("cmd")
+    if "ctrl" in lowered or "control" in lowered:
+        tokens.add("control")
+    return tokens
+
+
+def event_modifier_tokens(event) -> set[str]:
+    return _parse_modifiers(getattr(event, "key", None) or "")
+
+
+def key_tokens_for_match(key: str | None) -> set[str]:
+    if not key:
+        return set()
+    raw_tokens = str(key).lower().strip().replace("|", "+").replace(",", "+").split("+")
+    tokens = {item.strip() for item in raw_tokens if item.strip()}
+    expanded = set(tokens)
+    for token in tokens:
+        for prefix in ("kp_", "num_", "numpad_", "key_"):
+            if token.startswith(prefix):
+                expanded.add(token[len(prefix) :])
+    return expanded
+
+
+
+
+def lc_key_delta_from_event(event, modifiers=None) -> int:
+    key = getattr(event, "key", None)
+    if not key:
+        return 0
+    return lc_key_delta(key, modifiers)
+
+
+def lc_key_delta(key: str | None, modifiers=None) -> int:
+    if not key:
+        return 0
+    key = key.lower().strip()
+    if isinstance(modifiers, str):
+        modifier_set = {item for item in modifiers.replace("+", ",").lower().split(",") if item}
+    else:
+        modifier_set = {str(item).lower() for item in (modifiers or ())}
+    key_tokens = key_tokens_for_match(key)
+
+    if key == "+" or key.endswith("++"):
+        direction = 1
+        implied_ten = True
+    elif key_tokens & {"plus", "add"}:
+        direction = 1
+        implied_ten = False
+    elif key_tokens & {"=", "equal"}:
+        direction = 1
+        implied_ten = False
+    elif key_tokens & {"_", "underscore"}:
+        direction = -1
+        implied_ten = True
+    elif (
+        key_tokens & {"-", "minus", "hyphen", "dash", "subtract", "sub"}
+        or key.endswith("+-")
+    ):
+        direction = -1
+        implied_ten = False
+    else:
+        return 0
+
+    # Ctrl is the x10 modifier. Shift is unreliable on the macosx backend: it rewrites
+    # "-" into "_" and is dropped from KeyEvent.modifiers, so Ctrl+-/Ctrl+= (which arrive
+    # as clean "ctrl+-"/"ctrl+=" strings, like Cmd) are used instead. "+"/"_" still imply x10.
+    key_mods = _parse_modifiers(key)
+    has_cmd = bool(key_mods & {"cmd"} or modifier_set & {"cmd", "command", "super", "meta"})
+    has_control = bool(key_mods & {"control"} or modifier_set & {"ctrl", "control"})
+    step = 100 if has_cmd else 10 if (has_control or implied_ten) else 1
+    return direction * step
+
+
+def style_lightcurve_axes(ax) -> None:
+    ax.set_facecolor("black")
+    for spine in ax.spines.values():
+        spine.set_color("white")
+    ax.tick_params(colors="white")
+    ax.xaxis.label.set_color("white")
+    ax.yaxis.label.set_color("white")
+    ax.title.set_color("white")
+    ax.grid(color="white", alpha=0.25, linestyle=":", linewidth=0.6)
+
+
+def draw_lightcurve_on_axes(ax, path: Path, title: str, lc_bin: float | None = None) -> None:
+    time_values, rate_values, err_values, unit = read_lightcurve(path)
+    ax.clear()
+    style_lightcurve_axes(ax)
+    if err_values is not None:
+        ax.errorbar(time_values, rate_values, yerr=err_values, fmt="o-", ms=3, lw=1, color="cyan", ecolor="white", alpha=0.9)
+    else:
+        ax.plot(time_values, rate_values, "o-", ms=3, lw=1, color="cyan")
+    ax.set_xlabel(f"Time since start ({unit})")
+    ax.set_ylabel("Rate")
+    ax.set_title(title)
+    ax.text(
+        0.985,
+        0.965,
+        f"bin {format_lc_bin(lc_bin)}",
+        transform=ax.transAxes,
+        color="white",
+        fontsize=9,
+        ha="right",
+        va="top",
+        alpha=0.9,
+    )
+
+
+def install_lightcurve_rebin_controls(
+    fig,
+    ax,
+    initial_path: Path,
+    title: str,
+    lc_bin: float,
+    module_name: str,
+    modules_init: str,
+    eventfile: Path | None = None,
+    project_dir: Path | None = None,
+    mkf_file: Path | None = None,
+    psfcor: float = 1.0,
+) -> dict:
+    state = {
+        "source_path": initial_path,
+        "display_path": initial_path,
+        "bin": max(1.0, float(lc_bin)),
+        "custom_bin": False,
+        "last_error": None,
+        "interval_mode": False,
+        "intervals": [],
+        "extracting": False,
+        "held_modifiers": {},
+        "debug_keys": os.environ.get("DS8_DEBUG_KEYS", "").lower() in {"1", "true", "yes", "on"},
+    }
+
+    def draw_interval_overlays() -> None:
+        for start, stop in state["intervals"]:
+            ax.axvspan(start, stop, color="yellow", alpha=0.24, lw=0)
+        if state["interval_mode"]:
+            text = "GTI: drag intervals | Enter extract | u undo | Esc cancel"
+        elif state["intervals"]:
+            text = f"GTI intervals: {len(state['intervals'])} | Enter extract"
+        else:
+            text = "GTI: click button to select intervals"
+        ax.text(
+            0.015,
+            0.965,
+            text,
+            transform=ax.transAxes,
+            color="white",
+            fontsize=8,
+            ha="left",
+            va="top",
+            alpha=0.85,
+        )
+
+    def redraw(path: Path) -> None:
+        draw_lightcurve_on_axes(ax, path, title, state["bin"])
+        draw_interval_overlays()
+        fig.subplots_adjust(left=0.10, right=0.98, bottom=0.15, top=0.88)
+        state["display_path"] = path
+        state["last_error"] = None
+        fig.canvas.draw_idle()
+
+    def display_source(path: Path) -> None:
+        state["source_path"] = path
+        state["source_mtime"] = path_mtime_ns(path)
+        try:
+            display_path = (
+                rebin_lightcurve_for_display(path, state["bin"], module_name, modules_init)
+                if state["custom_bin"]
+                else path
+            )
+            redraw(display_path)
+        except Exception as exc:
+            message = str(exc)
+            if message != state["last_error"]:
+                terminal_warning("could not rebin LC", (("bin", format_lc_bin(state["bin"])), ("detail", message)))
+                state["last_error"] = message
+
+    def set_interval_mode(active: bool) -> None:
+        state["interval_mode"] = active
+        span_selector.set_active(active)
+        gti_button.set_text("GTI*" if active else "GTI")
+        redraw(state["display_path"])
+
+    def on_select_interval(x_min: float, x_max: float) -> None:
+        if not state["interval_mode"]:
+            return
+        start, stop = sorted((float(x_min), float(x_max)))
+        if stop - start <= 0:
+            return
+        state["intervals"].append((start, stop))
+        redraw(state["display_path"])
+
+    try:
+        span_selector = SpanSelector(
+            ax,
+            on_select_interval,
+            "horizontal",
+            useblit=True,
+            props={"facecolor": "yellow", "alpha": 0.22},
+            interactive=False,
+        )
+    except TypeError:
+        span_selector = SpanSelector(
+            ax,
+            on_select_interval,
+            "horizontal",
+            useblit=True,
+            rectprops={"facecolor": "yellow", "alpha": 0.22},
+        )
+    span_selector.set_active(False)
+
+    def on_gti_button(event) -> None:  # noqa: ARG001
+        if eventfile is None or project_dir is None:
+            terminal_warning("GTI spectrum selection is unavailable; missing event context")
+            return
+        set_interval_mode(not state["interval_mode"])
+
+    # GTI toggle built from the same OverlayButton entity as the main window's deg/hms
+    # button (transAxes -> pinned to this axes; figure-level -> survives ax.clear()).
+    gti_button = OverlayButton(ax, (0.85, 1.008), (0.11, 0.07), "GTI", on_gti_button, fontsize=12)
+
+    def extraction_context() -> tuple[Path, Path, Path | None, Path, Path]:
+        if eventfile is None or project_dir is None:
+            raise RuntimeError("missing event context")
+        workdir = state["source_path"].parent
+        src_reg = workdir / WORK_SRC_REGION_NAME
+        bkg_reg = workdir / WORK_BKG_REGION_NAME
+        if not src_reg.is_file() or not bkg_reg.is_file():
+            raise FileNotFoundError(f"source/background region files were not found in {workdir}")
+        mkf = None
+        if RESPONSE_FILES_MODE != "existing":
+            mkf = mkf_file if mkf_file is not None else resolve_mkf_file(None, project_dir, eventfile)
+        return eventfile, project_dir, mkf, src_reg, bkg_reg
+
+    def run_interval_extraction() -> None:
+        if state["extracting"]:
+            terminal_warning("GTI spectrum extraction is already running")
+            return
+        intervals = list(state["intervals"])
+        if not intervals:
+            terminal_warning("no GTI intervals selected")
+            return
+        state["extracting"] = True
+        started = time.monotonic()
+        marker = None
+        try:
+            evt, project, mkf, src_reg, bkg_reg = extraction_context()
+            base_time, template_header = lightcurve_time_base_seconds(state["display_path"])
+            spectrum_root = state["source_path"].parent.parent / NAMES.spec_workdir_name(evt)
+            output_root = prepare_overwrite_dir(spectrum_root / "gti_spectra")
+            # Marker so the main viewer can show the "gtispec" label white while this runs.
+            marker = output_root / ".extracting"
+            marker.write_text("")
+            terminal_block(
+                "GTI spectrum extraction",
+                (
+                    ("intervals", len(intervals)),
+                    ("output", output_root),
+                ),
+            )
+            products = []
+            for index, (x_start, x_stop) in enumerate(intervals, 1):
+                label = f"gti{index:02d}"
+                start = base_time + max(0.0, min(x_start, x_stop))
+                stop = base_time + max(x_start, x_stop)
+                if stop <= start:
+                    continue
+                gti_file = output_root / f"{label}.gti"
+                write_interval_gti(gti_file, start, stop, template_header)
+                products.append(
+                    extract_interval_spectrum_with_heasoft(
+                        eventfile=evt,
+                        project_dir=project,
+                        mkf_file=mkf,
+                        src_reg=src_reg,
+                        bkg_reg=bkg_reg,
+                        start=start,
+                        stop=stop,
+                        gti_file=gti_file,
+                        output_root=output_root,
+                        label=label,
+                        psfcor=psfcor,
+                        module_name=module_name,
+                        modules_init=modules_init,
+                    )
+                )
+            terminal_block(
+                "GTI spectra ready",
+                (
+                    ("elapsed", f"{time.monotonic() - started:.1f}s"),
+                    ("groups", len(products)),
+                    ("output", output_root),
+                ),
+            )
+        except Exception as exc:
+            terminal_warning("GTI spectrum extraction failed", (("detail", exc),))
+        finally:
+            if marker is not None:
+                try:
+                    marker.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            state["extracting"] = False
+
+    def extract_intervals_async() -> None:
+        thread = threading.Thread(target=run_interval_extraction, daemon=True)
+        thread.start()
+
+    def remember_pressed_modifiers(tokens: set[str]) -> None:
+        now = time.monotonic()
+        for token in tokens:
+            state["held_modifiers"][token] = now
+
+    def forget_released_modifiers(tokens: set[str]) -> None:
+        for token in tokens:
+            state["held_modifiers"].pop(token, None)
+
+    def recent_held_modifiers() -> set[str]:
+        now = time.monotonic()
+        expired = [token for token, seen in state["held_modifiers"].items() if now - seen > 5.0]
+        for token in expired:
+            state["held_modifiers"].pop(token, None)
+        return set(state["held_modifiers"])
+
+    def debug_key_event(event, modifiers: set[str], delta: int | None = None, *, release: bool = False) -> None:
+        if not state["debug_keys"]:
+            return
+        rows = [
+            ("phase", "release" if release else "press"),
+            ("key", repr(getattr(event, "key", None))),
+            ("modifiers", ",".join(sorted(modifiers)) or "-"),
+            ("held", ",".join(sorted(recent_held_modifiers())) or "-"),
+        ]
+        if delta is not None:
+            rows.append(("delta", delta))
+        terminal_block("LC key debug", rows)
+
+    def on_key(event) -> None:
+        key = (event.key or "").lower()
+        key_modifiers = _parse_modifiers(key)
+        if key_modifiers:
+            remember_pressed_modifiers(key_modifiers)
+        if key in {"g"}:
+            on_gti_button(event)
+            return
+        if key in {"enter", "return"} and (state["interval_mode"] or state["intervals"]):
+            extract_intervals_async()
+            return
+        if key == "u" and state["intervals"]:
+            state["intervals"].pop()
+            redraw(state["display_path"])
+            return
+        if key == "escape" and (state["interval_mode"] or state["intervals"]):
+            state["intervals"].clear()
+            set_interval_mode(False)
+            return
+        modifiers = event_modifier_tokens(event) | recent_held_modifiers()
+        delta = lc_key_delta_from_event(event, modifiers)
+        debug_key_event(event, modifiers, delta)
+        if delta == 0:
+            return
+        state["bin"] = max(1.0, state["bin"] + delta)
+        state["custom_bin"] = True
+        terminal_line(f"LC bin -> {format_lc_bin(state['bin'])}")
+        display_source(state["source_path"])
+
+    def on_key_release(event) -> None:
+        released = _parse_modifiers(getattr(event, "key", None) or "")
+        if released:
+            forget_released_modifiers(released)
+        debug_key_event(event, event_modifier_tokens(event) | recent_held_modifiers(), release=True)
+
+    fig.canvas.mpl_connect("key_press_event", on_key)
+    fig.canvas.mpl_connect("key_release_event", on_key_release)
+    redraw(initial_path)
+    state["display_source"] = display_source
+    fig._ds8_lc_span_selector = span_selector
+    fig._ds8_lc_gti_button = gti_button
+    return state
+
+
+def plot_lightcurve(
+    path: Path,
+    title: str,
+    lc_bin: float,
+    module_name: str,
+    modules_init: str,
+    eventfile: Path | None = None,
+    project_dir: Path | None = None,
+    mkf_file: Path | None = None,
+    psfcor: float = 1.0,
+):
+    fig, ax = plt.subplots(figsize=(8, 4.6), facecolor="black")
+    install_lightcurve_rebin_controls(
+        fig,
+        ax,
+        path,
+        title,
+        lc_bin,
+        module_name,
+        modules_init,
+        eventfile,
+        project_dir,
+        mkf_file,
+        psfcor,
+    )
+    return fig
+
+
+def write_lc_watch_file(watch_path: Path, lc_path: Path) -> None:
+    watch_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = watch_path.with_name(f"{watch_path.name}.tmp")
+    tmp_path.write_text(str(lc_path), encoding="utf-8")
+    tmp_path.replace(watch_path)
+
+
+def read_lc_watch_file(watch_path: Path) -> Path | None:
+    text = watch_path.read_text(encoding="utf-8").strip()
+    if not text:
+        return None
+    return Path(text).expanduser().resolve()
+
+
+def path_mtime_ns(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def prepare_overwrite_dir(path: Path, preserve_names: tuple[str, ...] = ()) -> Path:
+    preserve = set(preserve_names)
+    if path.exists() or path.is_symlink():
+        if preserve and path.is_dir() and not path.is_symlink():
+            for child in path.iterdir():
+                if child.name in preserve:
+                    continue
+                remove_path(child)
+        else:
+            remove_path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def plot_lightcurve_watch(
+    initial_path: Path,
+    watch_path: Path,
+    title: str,
+    lc_bin: float,
+    module_name: str,
+    modules_init: str,
+    eventfile: Path | None = None,
+    project_dir: Path | None = None,
+    mkf_file: Path | None = None,
+    psfcor: float = 1.0,
+):
+    fig, ax = plt.subplots(figsize=(8, 4.6), facecolor="black")
+    state = install_lightcurve_rebin_controls(
+        fig,
+        ax,
+        initial_path,
+        title,
+        lc_bin,
+        module_name,
+        modules_init,
+        eventfile,
+        project_dir,
+        mkf_file,
+        psfcor,
+    )
+    state["source_mtime"] = path_mtime_ns(initial_path)
+
+    def poll_watch_file() -> bool:
+        try:
+            next_path = read_lc_watch_file(watch_path)
+            if next_path is None:
+                return True
+            if not next_path.is_file():
+                return True
+            next_mtime = path_mtime_ns(next_path)
+            if next_path == state["source_path"] and next_mtime == state.get("source_mtime"):
+                return True
+            state["source_mtime"] = next_mtime
+            state["display_source"](next_path)
+        except Exception as exc:
+            message = str(exc)
+            if message != state["last_error"]:
+                terminal_warning("could not refresh LC window", (("detail", message),))
+                state["last_error"] = message
+        return True
+
+    timer = fig.canvas.new_timer(interval=40)
+    timer.add_callback(poll_watch_file)
+    timer.start()
+    fig._ds8_lc_timer = timer
+    return fig
+
+
+def extract_lightcurve_with_heasoft(
+    *,
+    eventfile: Path,
+    project_dir: Path,
+    wcs,
+    src_x: float,
+    src_y: float,
+    src_radius: float,
+    bkg_x: float,
+    bkg_y: float,
+    bkg_radius: float,
+    src_inner_radius: float = 0.0,
+    bkg_inner_radius: float = 0.0,
+    lc_bin: float,
+    pha_min: int,
+    pha_max: int,
+    energy_filter: bool,
+    extract_dir: str,
+    module_name: str,
+    modules_init: str,
+) -> Path:
+    root = Path(extract_dir).expanduser()
+    if not root.is_absolute():
+        root = project_dir / root
+    root.mkdir(parents=True, exist_ok=True)
+    workdir = prepare_overwrite_dir(root / NAMES.lc_workdir_name(eventfile))
+
+    src_reg = workdir / WORK_SRC_REGION_NAME
+    bkg_reg = workdir / WORK_BKG_REGION_NAME
+    write_region(src_reg, "src", src_x, src_y, src_radius, wcs, inner_radius=src_inner_radius)
+    write_region(bkg_reg, "bkg", bkg_x, bkg_y, bkg_radius, wcs, inner_radius=bkg_inner_radius)
+
+    src_lc = workdir / "src.lc"
+    bkg_lc = workdir / "bkg.lc"
+    corr_lc = workdir / "src-corr.lc"
+    rebin_lc = workdir / "src-corr-rebin.lc"
+
+    commands = [
+        "ds8",
+        "read event",
+        str(eventfile.parent),
+        eventfile.name,
+        "yes",
+        "extract all",
+        f"filter region {WORK_SRC_REGION_NAME}",
+    ]
+    if energy_filter:
+        commands.append(f"filter pha_cutoff {pha_min} {pha_max}")
+    commands.extend(
+        [
+            "extract curve",
+            "save curve src.lc",
+            "clear region",
+            f"filter region {WORK_BKG_REGION_NAME}",
+        ]
+    )
+    if energy_filter:
+        commands.append(f"filter pha_cutoff {pha_min} {pha_max}")
+    commands.extend(
+        [
+            "extract curve",
+            "save curve bkg.lc",
+            "exit",
+            "no",
+            "",
+        ]
+    )
+    xselect_input = "\n".join(commands)
+    result = run_heasoft_command(
+        ["xselect"],
+        cwd=workdir,
+        stdin_text=xselect_input,
+        module_name=module_name,
+        modules_init=modules_init,
+    )
+    require_success(result, "xselect")
+    if not src_lc.is_file() or not bkg_lc.is_file():
+        raise RuntimeError(f"xselect completed but expected light curves were not created in {workdir}")
+
+    src_area = src_radius ** 2 - src_inner_radius ** 2
+    bkg_area = bkg_radius ** 2 - bkg_inner_radius ** 2
+    bkg_scale = src_area / bkg_area
+    lcmath_input = "\n".join([str(src_lc), str(bkg_lc), str(corr_lc), "1", f"{bkg_scale:.10g}", "no", ""])
+    result = run_heasoft_command(
+        ["lcmath"],
+        cwd=workdir,
+        stdin_text=lcmath_input,
+        module_name=module_name,
+        modules_init=modules_init,
+    )
+    require_success(result, "lcmath")
+    if not corr_lc.is_file():
+        raise RuntimeError(f"lcmath completed but output was not created: {corr_lc}")
+
+    if lc_bin > 0:
+        lcurve_input = "\n".join(["1", str(corr_lc), "-", f"{lc_bin:g}", "INDEF", str(rebin_lc), "no", ""])
+        result = run_heasoft_command(
+            ["lcurve"],
+            cwd=workdir,
+            stdin_text=lcurve_input,
+            module_name=module_name,
+            modules_init=modules_init,
+        )
+        if result.returncode == 0 and rebin_lc.is_file():
+            return rebin_lc
+        terminal_warning("lcurve rebin failed; using unbinned lcmath output")
+        if result.stdout or result.stderr:
+            _draw_hint_bar()
+            print("\n".join((result.stdout + "\n" + result.stderr).splitlines()[-20:]), file=sys.stderr)
+            _draw_hint_bar()
+
+    return corr_lc
+
+
+
+def create_response_files(
+    *,
+    workdir: Path,
+    project_dir: Path,
+    eventfile: Path,
+    mkf_file: Path | None,
+    src_pha: Path,
+    rmf: Path,
+    expo: Path,
+    arf: Path,
+    psfcor: float,
+    module_name: str,
+    modules_init: str,
+    label: str = "",
+) -> None:
+    suffix = f" {label}" if label else ""
+    if mkf_file is None:
+        raise FileNotFoundError("MKF file is required when [response_files].mode = 'generate'")
+
+    python_bin_dir = Path(sys.executable).resolve().parent
+    result = run_heasoft_command(
+        ["fxtrmfgen", f"specfile={src_pha.name}", f"outfile={rmf.name}"],
+        cwd=workdir, stdin_text="", module_name=module_name, modules_init=modules_init,
+        isolate_home=False, python_bin_dir=python_bin_dir,
+    )
+    require_success(result, f"fxtrmfgen{suffix}")
+    if not rmf.is_file():
+        raise RuntimeError(f"fxtrmfgen completed but output was not created: {rmf}")
+    result = run_heasoft_command(
+        ["fxtexpogen", f"mkffile={mkf_file}", f"evtfile={eventfile}", f"outfile={expo.name}"],
+        cwd=workdir, stdin_text="", module_name=module_name, modules_init=modules_init,
+        isolate_home=False, python_bin_dir=python_bin_dir,
+    )
+    require_success(result, f"fxtexpogen{suffix}")
+    if not expo.is_file():
+        raise RuntimeError(f"fxtexpogen completed but output was not created: {expo}")
+    result = run_heasoft_command(
+        ["fxtarfgen", f"specfile={src_pha.name}", f"expfile={expo.name}", f"psfcor={psfcor:g}", f"outfile={arf.name}"],
+        cwd=workdir, stdin_text="", module_name=module_name, modules_init=modules_init,
+        isolate_home=False, python_bin_dir=python_bin_dir,
+    )
+    require_success(result, f"fxtarfgen{suffix}")
+    if not arf.is_file():
+        raise RuntimeError(f"fxtarfgen completed but output was not created: {arf}")
+
+
+def extract_spectrum_with_heasoft(
+    *,
+    eventfile: Path,
+    project_dir: Path,
+    mkf_file: Path | None,
+    wcs,
+    src_x: float,
+    src_y: float,
+    src_radius: float,
+    bkg_x: float,
+    bkg_y: float,
+    bkg_radius: float,
+    src_inner_radius: float = 0.0,
+    bkg_inner_radius: float = 0.0,
+    extract_dir: str,
+    psfcor: float,
+    module_name: str,
+    modules_init: str,
+) -> dict[str, Path]:
+    root = Path(extract_dir).expanduser()
+    if not root.is_absolute():
+        root = project_dir / root
+    root.mkdir(parents=True, exist_ok=True)
+    workdir = prepare_overwrite_dir(root / NAMES.spec_workdir_name(eventfile), preserve_names=("gti_spectra",))
+
+    src_reg = workdir / WORK_SRC_REGION_NAME
+    bkg_reg = workdir / WORK_BKG_REGION_NAME
+    write_region(src_reg, "src", src_x, src_y, src_radius, wcs, inner_radius=src_inner_radius)
+    write_region(bkg_reg, "bkg", bkg_x, bkg_y, bkg_radius, wcs, inner_radius=bkg_inner_radius)
+
+    products = NAMES.spectrum_products(workdir, eventfile, source=SOURCE_ID)
+    src_pha = products["src_pha"]
+    bkg_pha = products["bkg_pha"]
+
+    xselect_input = "\n".join(
+        [
+            "ds8spec",
+            "read event",
+            str(eventfile.parent),
+            eventfile.name,
+            "yes",
+            "extract all",
+            f"filter region {WORK_SRC_REGION_NAME}",
+            "extract spectrum",
+            f"save spectrum {src_pha.name}",
+            "clear region",
+            f"filter region {WORK_BKG_REGION_NAME}",
+            "extract spectrum",
+            f"save spectrum {bkg_pha.name}",
+            "exit",
+            "no",
+            "",
+        ]
+    )
+    result = run_heasoft_command(
+        ["xselect"],
+        cwd=workdir,
+        stdin_text=xselect_input,
+        module_name=module_name,
+        modules_init=modules_init,
+    )
+    require_success(result, "xselect spectrum")
+    if not src_pha.is_file() or not bkg_pha.is_file():
+        log_path = workdir / "xselect.log"
+        detail = f" Check xselect log: {log_path}" if log_path.is_file() else ""
+        raise RuntimeError(f"xselect completed but expected spectra were not created in {workdir}.{detail}")
+
+    if RESPONSE_FILES_MODE == "existing":
+        products = {
+            "src_pha": src_pha,
+            "bkg_pha": bkg_pha,
+            **existing_response_files(project_dir, eventfile),
+        }
+    else:
+        create_response_files(
+            workdir=workdir, project_dir=project_dir, eventfile=eventfile, mkf_file=mkf_file,
+            src_pha=src_pha, rmf=products["rmf"], expo=products["expo"], arf=products["arf"],
+            psfcor=psfcor, module_name=module_name, modules_init=modules_init,
+        )
+
+    return {
+        "workdir": workdir,
+        "src_pha": src_pha,
+        "bkg_pha": bkg_pha,
+        **{key: value for key, value in products.items() if key in {"rmf", "expo", "arf"}},
+    }
+
+
+def extract_interval_spectrum_with_heasoft(
+    *,
+    eventfile: Path,
+    project_dir: Path,
+    mkf_file: Path | None,
+    src_reg: Path,
+    bkg_reg: Path,
+    start: float,
+    stop: float,
+    gti_file: Path,
+    output_root: Path,
+    label: str,
+    psfcor: float,
+    module_name: str,
+    modules_init: str,
+) -> dict[str, Path]:
+    workdir = prepare_overwrite_dir(output_root / label)
+    local_src_reg = workdir / WORK_SRC_REGION_NAME
+    local_bkg_reg = workdir / WORK_BKG_REGION_NAME
+    local_gti = workdir / gti_file.name
+    shutil.copyfile(src_reg, local_src_reg)
+    shutil.copyfile(bkg_reg, local_bkg_reg)
+    shutil.copyfile(gti_file, local_gti)
+
+    products = NAMES.spectrum_products(workdir, eventfile, label=label, source=SOURCE_ID)
+    src_pha = products["src_pha"]
+    bkg_pha = products["bkg_pha"]
+
+    xselect_input = "\n".join(
+        [
+            f"ds8{label}",
+            "read event",
+            str(eventfile.parent),
+            eventfile.name,
+            "yes",
+            "filter time scc",
+            f"{start:.9f}, {stop:.9f}",
+            "x",
+            "extract all",
+            f"filter region {WORK_SRC_REGION_NAME}",
+            "extract spectrum",
+            f"save spectrum {src_pha.name}",
+            "clear region",
+            f"filter region {WORK_BKG_REGION_NAME}",
+            "extract spectrum",
+            f"save spectrum {bkg_pha.name}",
+            "exit",
+            "no",
+            "",
+        ]
+    )
+    result = run_heasoft_command(
+        ["xselect"],
+        cwd=workdir,
+        stdin_text=xselect_input,
+        module_name=module_name,
+        modules_init=modules_init,
+    )
+    require_success(result, f"xselect spectrum {label}")
+    if not src_pha.is_file() or not bkg_pha.is_file():
+        log_path = workdir / "xselect.log"
+        detail = f" Check xselect log: {log_path}" if log_path.is_file() else ""
+        raise RuntimeError(f"xselect completed but expected spectra were not created in {workdir}.{detail}")
+
+    if RESPONSE_FILES_MODE == "existing":
+        products = {
+            "src_pha": src_pha,
+            "bkg_pha": bkg_pha,
+            **existing_response_files(project_dir, eventfile, label=label),
+        }
+    else:
+        create_response_files(
+            workdir=workdir, project_dir=project_dir, eventfile=eventfile, mkf_file=mkf_file,
+            src_pha=src_pha, rmf=products["rmf"], expo=products["expo"], arf=products["arf"],
+            psfcor=psfcor, module_name=module_name, modules_init=modules_init,
+            label=label,
+        )
+
+    return {
+        "workdir": workdir,
+        "gti": local_gti,
+        "src_pha": src_pha,
+        "bkg_pha": bkg_pha,
+        **{key: value for key, value in products.items() if key in {"rmf", "expo", "arf"}},
+    }
+
+
+class OverlayButton:
+    """Small deg/hms-style button: a bordered rectangle with a centered label.
+
+    Positioned in a target axes' fraction coordinates (transAxes) so it stays pinned to
+    that axes regardless of data zoom/pan, but drawn as a figure-level artist so it also
+    survives ax.clear(). Handles its own left-click via the figure's button_press_event.
+    """
+
+    def __init__(self, ax, xy, size, text, on_click, *, fontsize=7):
+        self.ax = ax
+        self.fig = ax.figure
+        self.on_click = on_click
+        x, y = xy
+        w, h = size
+        trans = ax.transAxes
+        self.rect = Rectangle(
+            (x, y),
+            w,
+            h,
+            transform=trans,
+            facecolor="black",
+            edgecolor="white",
+            lw=0.6,
+            alpha=0.65,
+            clip_on=False,
+            zorder=21,
+            label="_nolegend_",
+        )
+        self.label = Text(
+            x + 0.5 * w,
+            y + 0.5 * h,
+            text,
+            transform=trans,
+            color="white",
+            fontsize=fontsize,
+            ha="center",
+            va="center",
+            clip_on=False,
+            zorder=22,
+        )
+        self.fig.add_artist(self.rect)
+        self.fig.add_artist(self.label)
+        self._cid = self.fig.canvas.mpl_connect("button_press_event", self._on_press)
+
+    def contains(self, event) -> bool:
+        if not self.rect.get_visible() or getattr(event, "button", None) != 1:
+            return False
+        hit, _ = self.rect.contains(event)
+        return bool(hit)
+
+    def _on_press(self, event) -> None:
+        if self.contains(event):
+            self.on_click(event)
+
+    def set_text(self, text) -> None:
+        self.label.set_text(text)
+
+    def set_visible(self, visible: bool) -> None:
+        self.rect.set_visible(visible)
+        self.label.set_visible(visible)
+
+
+class InteractiveZoom:
+    def __init__(
+        self,
+        *,
+        fig,
+        ax,
+        inset,
+        counts,
+        wcs,
+        eventfile: Path,
+        project_dir: Path,
+        src_reg: Path,
+        bkg_reg: Path,
+        src_circle,
+        bkg_circle,
+        src_region,
+        bkg_region,
+        src_patches,
+        bkg_patches,
+        zoom_factor: float,
+        output: Path,
+        dpi: int,
+        lc_bin: float,
+        pha_min: int,
+        pha_max: int,
+        energy_filter: bool,
+        extract_dir: str,
+        module_name: str,
+        modules_init: str,
+        mkf_file: Path | None,
+        psfcor: float,
+        drag_region_body: bool = False,
+    ) -> None:
+        self.fig = fig
+        self.ax = ax
+        self.inset = inset
+        self.counts = counts
+        self.wcs = wcs
+        self.eventfile = eventfile
+        self.project_dir = project_dir
+        self.src_reg = src_reg
+        self.bkg_reg = bkg_reg
+        self.src_circle = src_circle
+        self.bkg_circle = bkg_circle
+        self.src_patches = src_patches
+        self.bkg_patches = bkg_patches
+        self.output = output
+        self.dpi = dpi
+        self.dragging = False
+        self.drag_target: str | None = None
+        self.selected_group: str | None = None
+        self.hover_group: str | None = None
+        self.drag_offset = (0.0, 0.0)
+        self.pan_start_px = (0.0, 0.0)
+        self.pan_start = (0.0, 0.0)
+        self.pan_xlim = (0.0, 1.0)
+        self.pan_ylim = (0.0, 1.0)
+        self.initial_main_xlim = tuple(ax.get_xlim())
+        self.initial_main_ylim = tuple(ax.get_ylim())
+        self.half_width = src_circle.radius * zoom_factor
+        self.connectors: list[Line2D] = []
+        self.handles: dict[str, Rectangle] = {}
+        self.inset_move_handle: Rectangle | None = None
+        self.src_x = float(src_circle.x)
+        self.src_y = float(src_circle.y)
+        self.src_radius = float(src_circle.radius)
+        self.bkg_x = float(bkg_circle.x)
+        self.bkg_y = float(bkg_circle.y)
+        self.bkg_radius = float(bkg_circle.radius)
+        self.src_inner_radius = float(src_region.inner_radius) if isinstance(src_region, PixelAnnulus) else 0.0
+        self.bkg_inner_radius = float(bkg_region.inner_radius) if isinstance(bkg_region, PixelAnnulus) else 0.0
+        self.src_region_type = "annulus" if isinstance(src_region, PixelAnnulus) and src_region.inner_radius > 0 else "circle"
+        self.bkg_region_type = "annulus" if isinstance(bkg_region, PixelAnnulus) and bkg_region.inner_radius > 0 else "circle"
+        self.initial_src = (self.src_x, self.src_y)
+        self.initial_bkg = (self.bkg_x, self.bkg_y)
+        self.initial_src_radius = self.src_radius
+        self.initial_bkg_radius = self.bkg_radius
+        self.initial_src_inner_radius = self.src_inner_radius
+        self.initial_bkg_inner_radius = self.bkg_inner_radius
+        self.initial_src_region_type = self.src_region_type
+        self.initial_bkg_region_type = self.bkg_region_type
+        self.initial_zoom_factor = zoom_factor
+        self.src_label_original = src_reg.name
+        self.bkg_label_original = bkg_reg.name
+        self.src_label_moved = f"ds8-{src_reg.name}"
+        self.bkg_label_moved = f"ds8-{bkg_reg.name}"
+        self.lc_bin = lc_bin
+        self.pha_min = pha_min
+        self.pha_max = pha_max
+        self.energy_filter = energy_filter
+        self.extract_dir = extract_dir
+        self.module_name = module_name
+        self.modules_init = modules_init
+        self.mkf_file = mkf_file
+        self.psfcor = psfcor
+        self.drag_region_body = drag_region_body
+        self.initial_inset_position = tuple(inset.get_position().bounds)
+        self.lightcurve_processes: list[subprocess.Popen] = []
+        self.xspec_processes: list[subprocess.Popen] = []
+        self.next_extract = "lightcurve"
+        self.last_lightcurve_path: Path | None = None
+        self.last_lightcurve_signature: tuple | None = None
+        self.last_spectrum_products: dict[str, Path] | None = None
+        self.last_spectrum_signature: tuple | None = None
+        # Product-status tracking for the floating labels. These persist across region
+        # moves (unlike last_*_signature which get cleared) so a moved region can show red.
+        self.lc_status_sig: tuple | None = None
+        self.spec_status_sig: tuple | None = None
+        self.gti_status_sig: tuple | None = None
+        self.lc_running = False
+        self.spec_running = False
+        self.gti_running = False
+        self._gti_seen_mtime: int | None = None
+        self._gti_baseline_ns: int = 0
+        self.region_changed_notice_shown = False
+        self.lc_watch_path: Path | None = None
+        self.live_lc_enabled = False
+        self.live_lc_inflight = False
+        self.live_lc_pending = False
+        self.live_lc_last_started = 0.0
+        self.live_lc_min_interval = 1.0 / 25.0
+        self.live_lc_generation = 0
+        self.live_lc_lock = threading.Lock()
+        self.closed = False
+        self.coord_format = "deg"
+        self.base_title = ax.get_title()
+        self.source_coord_text = ax.text(
+            0.5,
+            1.028,
+            "",
+            transform=ax.transAxes,
+            color="white",
+            fontsize=9,
+            ha="center",
+            va="center",
+            zorder=20,
+        )
+        # deg/hms toggle and "save" button, both built from the shared OverlayButton entity
+        # so they position and behave identically. transAxes -> pinned to this axes.
+        self.coord_button = OverlayButton(
+            ax, (0.84, 1.012), (0.056, 0.032), "deg", lambda event: self.toggle_coord_format(), fontsize=7
+        )
+        if self.wcs is None:
+            self.coord_button.set_visible(False)
+        # "save" button (right of the deg/hms toggle): writes the current regions to new
+        # ds8-prefixed files without touching the originals.
+        self.save_button = OverlayButton(
+            ax, (0.906, 1.012), (0.064, 0.032), "save", lambda event: self.save_regions(), fontsize=7
+        )
+        self.overlay_buttons = [self.coord_button, self.save_button]
+
+        self.bounds = square_window_inside_frame(self.src_x, self.src_y, self.half_width, counts)
+        x0, x1, y0, y1 = self.bounds
+        self.inset_rect = Rectangle(
+            (0, 0),
+            1,
+            1,
+            transform=inset.transAxes,
+            fill=False,
+            ec="white",
+            lw=1.0,
+            alpha=0.95,
+            clip_on=False,
+            zorder=8,
+        )
+        inset.add_patch(self.inset_rect)
+        # Floating product-status labels pinned to the source region's lower-left corner
+        # with fixed (zoom-independent) size and spacing. Light green when the product
+        # matches the current regions, red once the regions have moved.
+        _status_kwargs = dict(fontsize=7, ha="left", va="center", fontweight="bold", zorder=9, clip_on=False)
+        self.curve_label = ax.text(0, 0, "curve", color="lightgreen", **_status_kwargs)
+        self.spec_label = ax.text(0, 0, "spec", color="lightgreen", **_status_kwargs)
+        self.gtispec_label = ax.text(0, 0, "gtispec", color="lightgreen", **_status_kwargs)
+        self.status_labels = (
+            (self.curve_label, "lc_status_sig", "lc_running"),
+            (self.spec_label, "spec_status_sig", "spec_running"),
+            (self.gtispec_label, "gti_status_sig", "gti_running"),
+        )
+        for _label, _, _ in self.status_labels:
+            _label.set_visible(False)
+        self.src_highlight = Circle(
+            (self.src_x, self.src_y),
+            self.src_radius,
+            fill=False,
+            ec="yellow",
+            lw=1.6,
+            alpha=0.0,
+            zorder=9,
+        )
+        self.bkg_highlight = Circle(
+            (self.bkg_x, self.bkg_y),
+            self.bkg_radius,
+            fill=False,
+            ec="yellow",
+            lw=1.6,
+            alpha=0.0,
+            zorder=9,
+        )
+        ax.add_patch(self.src_highlight)
+        ax.add_patch(self.bkg_highlight)
+
+        self.src_inner_patches = self._make_inner_patches("src")
+        self.bkg_inner_patches = self._make_inner_patches("bkg")
+        self.create_handles()
+        self.apply_bounds()
+        self.update_source_coord_text()
+
+        self.cids = [
+            fig.canvas.mpl_connect("button_press_event", self.on_press),
+            fig.canvas.mpl_connect("motion_notify_event", self.on_motion),
+            fig.canvas.mpl_connect("button_release_event", self.on_release),
+            fig.canvas.mpl_connect("scroll_event", self.on_scroll),
+            fig.canvas.mpl_connect("key_press_event", self.on_key),
+            fig.canvas.mpl_connect("close_event", self.on_close),
+        ]
+
+        # Poll the filesystem for GTI spectra produced by the light-curve window process.
+        self.status_timer = fig.canvas.new_timer(interval=1500)
+        self.status_timer.add_callback(self._poll_status)
+        self.status_timer.start()
+
+    REGION_TYPES = ["circle", "annulus"]
+
+    def _make_inner_patches(self, group: str) -> tuple:
+        x = self.src_x if group == "src" else self.bkg_x
+        y = self.src_y if group == "src" else self.bkg_y
+        ir = self.src_inner_radius if group == "src" else self.bkg_inner_radius
+        rtype = self.src_region_type if group == "src" else self.bkg_region_type
+        color = "red" if group == "src" else "cyan"
+        visible = rtype == "annulus" and ir > 0
+        patches = []
+        for target_ax in (self.ax, self.inset):
+            c = Circle((x, y), max(ir, 1.0), fill=False, lw=1.1, ec=color, ls="--", zorder=5)
+            c.set_visible(visible)
+            target_ax.add_patch(c)
+            patches.append(c)
+        return tuple(patches)
+
+    def _update_inner_patches(self, group: str) -> None:
+        patches = self.src_inner_patches if group == "src" else self.bkg_inner_patches
+        x = self.src_x if group == "src" else self.bkg_x
+        y = self.src_y if group == "src" else self.bkg_y
+        ir = self.src_inner_radius if group == "src" else self.bkg_inner_radius
+        rtype = self.src_region_type if group == "src" else self.bkg_region_type
+        visible = rtype == "annulus" and ir > 0
+        for p in patches:
+            p.center = (x, y)
+            p.set_radius(max(ir, 1.0))
+            p.set_visible(visible)
+
+    def make_handle(self, name: str, color: str) -> None:
+        size = self.handle_size()
+        handle = Rectangle(
+            (0.0, 0.0),
+            size,
+            size,
+            facecolor=color,
+            edgecolor="white" if color != "white" else "black",
+            lw=0.8,
+            alpha=0.95,
+            zorder=12,
+            label="_nolegend_",
+        )
+        self.ax.add_patch(handle)
+        self.handles[name] = handle
+
+    def create_handles(self) -> None:
+        self.make_handle("src_move", "red")
+        self.make_handle("src_resize", "red")
+        self.make_handle("src_inner_resize", "red")
+        self.make_handle("bkg_move", "cyan")
+        self.make_handle("bkg_resize", "cyan")
+        self.make_handle("bkg_inner_resize", "#66cccc")
+        self.make_inset_handle()
+
+    def make_inset_handle(self) -> None:
+        width, height = self.figure_handle_size()
+        handle = Rectangle(
+            (0.0, 0.0),
+            width,
+            height,
+            transform=self.fig.transFigure,
+            facecolor="white",
+            edgecolor="black",
+            lw=0.8,
+            alpha=0.95,
+            clip_on=False,
+            zorder=20,
+            label="_nolegend_",
+        )
+        self.fig.add_artist(handle)
+        self.inset_move_handle = handle
+
+    def handle_size(self) -> float:
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        return max(3.0, 0.012 * max(abs(x1 - x0), abs(y1 - y0)))
+
+    def figure_handle_size(self) -> tuple[float, float]:
+        width_px, height_px = self.fig.canvas.get_width_height()
+        return 10.0 / max(width_px, 1), 10.0 / max(height_px, 1)
+
+    def place_handle(self, name: str, x: float, y: float) -> None:
+        size = self.handle_size()
+        handle = self.handles[name]
+        handle.set_width(size)
+        handle.set_height(size)
+        handle.set_xy((x - 0.5 * size, y - 0.5 * size))
+
+    def place_inset_handle(self) -> None:
+        if self.inset_move_handle is None:
+            return
+        width, height = self.figure_handle_size()
+        bbox = self.inset.get_position()
+        self.inset_move_handle.set_width(width)
+        self.inset_move_handle.set_height(height)
+        self.inset_move_handle.set_xy((bbox.x1 - 0.5 * width, bbox.y1 - 0.5 * height))
+
+    def update_handles(self) -> None:
+        self.place_handle("src_resize", self.src_x + self.src_radius, self.src_y)
+        self.place_handle("src_move", self.src_x + self.src_radius, self.src_y + self.src_radius)
+        self.place_handle("bkg_resize", self.bkg_x + self.bkg_radius, self.bkg_y)
+        self.place_handle("bkg_move", self.bkg_x + self.bkg_radius, self.bkg_y + self.bkg_radius)
+        if self.src_region_type == "annulus":
+            self.place_handle("src_inner_resize", self.src_x + self.src_inner_radius, self.src_y)
+            self.handles["src_inner_resize"].set_visible(True)
+        else:
+            self.handles["src_inner_resize"].set_visible(False)
+        if self.bkg_region_type == "annulus":
+            self.place_handle("bkg_inner_resize", self.bkg_x + self.bkg_inner_radius, self.bkg_y)
+            self.handles["bkg_inner_resize"].set_visible(True)
+        else:
+            self.handles["bkg_inner_resize"].set_visible(False)
+        self.place_inset_handle()
+
+    def handle_group(self, target: str | None) -> str | None:
+        if target is None:
+            return None
+        if target.startswith("src"):
+            return "src"
+        if target.startswith("bkg"):
+            return "bkg"
+        if target == "inset_move":
+            return "inset"
+        return None
+
+    def _region_body_contains(self, group: str, x: float, y: float) -> bool:
+        if group == "src":
+            cx, cy, radius, inner, rtype = self.src_x, self.src_y, self.src_radius, self.src_inner_radius, self.src_region_type
+        else:
+            cx, cy, radius, inner, rtype = self.bkg_x, self.bkg_y, self.bkg_radius, self.bkg_inner_radius, self.bkg_region_type
+        dist = math.hypot(x - cx, y - cy)
+        if rtype == "annulus" and inner > 0:
+            return inner <= dist <= radius
+        return dist <= radius
+
+    def update_highlights(self) -> None:
+        active = self.selected_group or self.hover_group
+        self.src_highlight.set_alpha(0.9 if active == "src" else 0.0)
+        self.bkg_highlight.set_alpha(0.9 if active == "bkg" else 0.0)
+        src_selected = active == "src"
+        bkg_selected = active == "bkg"
+        src_color = "yellow" if src_selected else "red"
+        bkg_color = "yellow" if bkg_selected else "cyan"
+        src_lw = 1.6 if src_selected else 1.1
+        bkg_lw = 1.6 if bkg_selected else 1.1
+        self.src_inner_patches[0].set_edgecolor(src_color)
+        self.src_inner_patches[0].set_linewidth(src_lw)
+        self.src_inner_patches[1].set_edgecolor("red")
+        self.src_inner_patches[1].set_linewidth(src_lw)
+        for p in self.bkg_inner_patches:
+            p.set_edgecolor(bkg_color)
+            p.set_linewidth(bkg_lw)
+        for name, handle in self.handles.items():
+            group = self.handle_group(name)
+            handle.set_linewidth(1.6 if active == group else 0.8)
+        if self.inset_move_handle is not None:
+            self.inset_move_handle.set_linewidth(1.6 if active == "inset" else 0.8)
+
+    def info(
+        self,
+        message: str,
+        rows: list[tuple[str, object]] | tuple[tuple[str, object], ...] = (),
+        notes: list[str] | tuple[str, ...] = (),
+        *,
+        block: bool = False,
+    ) -> None:
+        if block or rows or notes:
+            terminal_block(message, rows, notes)
+        else:
+            terminal_line(message)
+
+    def source_coord_label(self) -> str:
+        if self.wcs is None:
+            return f"Source X={self.src_x + 1:.3f}, Y={self.src_y + 1:.3f}"
+        try:
+            center = self.wcs.pixel_to_world(self.src_x, self.src_y)
+            if self.coord_format == "hms":
+                ra_text = center.ra.to_string(unit=u.hourangle, sep=":", precision=2, pad=True)
+                dec_text = center.dec.to_string(unit=u.deg, sep=":", precision=2, alwayssign=True, pad=True)
+                return f"Source RA={ra_text}, Dec={dec_text}"
+            return f"Source RA={center.ra.deg:.6f} deg, Dec={center.dec.deg:.6f} deg"
+        except Exception:
+            return f"Source X={self.src_x + 1:.3f}, Y={self.src_y + 1:.3f}"
+
+    def update_source_coord_text(self) -> None:
+        self.source_coord_text.set_text(self.source_coord_label())
+        self.coord_button.set_text(self.coord_format)
+
+    def toggle_coord_format(self) -> None:
+        if self.wcs is None:
+            return
+        self.coord_format = "hms" if self.coord_format == "deg" else "deg"
+        self.update_source_coord_text()
+        self.fig.canvas.draw_idle()
+
+    def save_regions(self) -> None:
+        # Write current regions to new ds8-prefixed files; never overwrite originals.
+        src_out = self.src_reg.with_name(f"ds8-{self.src_reg.name}")
+        bkg_out = self.bkg_reg.with_name(f"ds8-{self.bkg_reg.name}")
+        try:
+            write_region(src_out, "src", self.src_x, self.src_y, self.src_radius, self.wcs, inner_radius=self.src_inner_radius)
+            write_region(bkg_out, "bkg", self.bkg_x, self.bkg_y, self.bkg_radius, self.wcs, inner_radius=self.bkg_inner_radius)
+        except Exception as exc:
+            self.warn("could not save regions", (("detail", exc),))
+            return
+        self.info("saved regions", (("src", src_out), ("bkg", bkg_out)), block=True)
+
+    def bounds_center(self) -> tuple[float, float]:
+        x0, x1, y0, y1 = self.bounds
+        return 0.5 * (x0 + x1), 0.5 * (y0 + y1)
+
+    def set_patch_centers(self, patches, x: float, y: float) -> None:
+        for patch in patches:
+            patch.center = (x, y)
+
+    def set_patch_radii(self, patches, radius: float) -> None:
+        for patch in patches:
+            patch.radius = radius
+
+    def current_extraction_signature(self) -> tuple:
+        return (
+            str(self.eventfile),
+            round(self.src_x, 6),
+            round(self.src_y, 6),
+            round(self.src_radius, 6),
+            round(self.src_inner_radius, 6),
+            round(self.bkg_x, 6),
+            round(self.bkg_y, 6),
+            round(self.bkg_radius, 6),
+            round(self.bkg_inner_radius, 6),
+            self.energy_filter,
+            self.pha_min if self.energy_filter else None,
+            self.pha_max if self.energy_filter else None,
+        )
+
+    def extraction_root(self) -> Path:
+        root = Path(self.extract_dir).expanduser()
+        if not root.is_absolute():
+            root = self.project_dir / root
+        return root
+
+    def ensure_lc_watch_path(self) -> Path:
+        if self.lc_watch_path is None:
+            self.lc_watch_path = self.extraction_root() / f"ds8-lc-watch-{os.getpid()}.txt"
+        self.lc_watch_path.parent.mkdir(parents=True, exist_ok=True)
+        return self.lc_watch_path
+
+    def clear_spectrum_state(self) -> None:
+        self.last_spectrum_products = None
+        self.last_spectrum_signature = None
+
+    def clear_extraction_state(self) -> None:
+        self.next_extract = "lightcurve"
+        self.last_lightcurve_path = None
+        self.last_lightcurve_signature = None
+        self.clear_spectrum_state()
+        self.region_changed_notice_shown = False
+        with self.live_lc_lock:
+            self.live_lc_enabled = False
+            self.live_lc_pending = False
+            self.live_lc_generation += 1
+
+    def warn_if_region_products_changed(self) -> None:
+        if self.region_changed_notice_shown:
+            return
+        if self.last_lightcurve_path is None and self.last_spectrum_products is None:
+            return
+        self.warn("regions changed; previous LC/spectrum products no longer match current regions.")
+        self.region_changed_notice_shown = True
+
+    def live_lc_extract_request(self) -> tuple[tuple, dict]:
+        signature = self.current_extraction_signature()
+        kwargs = {
+            "eventfile": self.eventfile,
+            "project_dir": self.project_dir,
+            "wcs": self.wcs,
+            "src_x": self.src_x,
+            "src_y": self.src_y,
+            "src_radius": self.src_radius,
+            "bkg_x": self.bkg_x,
+            "bkg_y": self.bkg_y,
+            "bkg_radius": self.bkg_radius,
+            "src_inner_radius": self.src_inner_radius,
+            "bkg_inner_radius": self.bkg_inner_radius,
+            "lc_bin": self.lc_bin,
+            "pha_min": self.pha_min,
+            "pha_max": self.pha_max,
+            "energy_filter": self.energy_filter,
+            "extract_dir": self.extract_dir,
+            "module_name": self.module_name,
+            "modules_init": self.modules_init,
+        }
+        return signature, kwargs
+
+    def _src_moved(self) -> bool:
+        return (
+            (self.src_x, self.src_y) != self.initial_src
+            or self.src_radius != self.initial_src_radius
+            or self.src_inner_radius != self.initial_src_inner_radius
+            or self.src_region_type != self.initial_src_region_type
+        )
+
+    def _bkg_moved(self) -> bool:
+        return (
+            (self.bkg_x, self.bkg_y) != self.initial_bkg
+            or self.bkg_radius != self.initial_bkg_radius
+            or self.bkg_inner_radius != self.initial_bkg_inner_radius
+            or self.bkg_region_type != self.initial_bkg_region_type
+        )
+
+    def update_legend_labels(self) -> None:
+        src_label = self.src_label_moved if self._src_moved() else self.src_label_original
+        bkg_label = self.bkg_label_moved if self._bkg_moved() else self.bkg_label_original
+        self.src_patches[1].set_label(src_label)
+        self.bkg_patches[1].set_label(bkg_label)
+        self.ax.legend(loc="upper left", frameon=False, labelcolor="white")
+
+    def on_region_changed(self, *, force_lc_refresh: bool = False) -> None:
+        self.warn_if_region_products_changed()
+        self.update_legend_labels()
+        if LIVE_LC_REFRESH and self.live_lc_enabled and self.last_lightcurve_path is not None:
+            self.last_lightcurve_signature = None
+            self.clear_spectrum_state()
+            self.next_extract = "spectrum"
+            self.schedule_live_lc_refresh(force=force_lc_refresh)
+        else:
+            self.clear_extraction_state()
+        self.update_status_labels()
+
+    def schedule_live_lc_refresh(self, *, force: bool = False) -> None:
+        if not self.live_lc_enabled:
+            return
+        signature, kwargs = self.live_lc_extract_request()
+        thread: threading.Thread | None = None
+        with self.live_lc_lock:
+            if not self.live_lc_enabled:
+                return
+            self.live_lc_pending = True
+            if self.live_lc_inflight:
+                return
+            now = time.monotonic()
+            if not force and now - self.live_lc_last_started < self.live_lc_min_interval:
+                return
+            self.live_lc_pending = False
+            self.live_lc_inflight = True
+            self.live_lc_last_started = now
+            generation = self.live_lc_generation
+            thread = threading.Thread(target=self.run_live_lc_refresh, args=(signature, kwargs, generation), daemon=True)
+        thread.start()
+
+    def run_live_lc_refresh(self, signature: tuple, kwargs: dict, generation: int) -> None:
+        started = time.monotonic()
+        lc_path: Path | None = None
+        try:
+            lc_path = extract_lightcurve_with_heasoft(**kwargs)
+        except Exception as exc:
+            self.warn(f"LC refresh failed: {exc}")
+
+        should_start_pending = False
+        if lc_path is not None:
+            try:
+                with self.live_lc_lock:
+                    if not self.live_lc_enabled or generation != self.live_lc_generation:
+                        lc_path = None
+                        watch_path = None
+                    else:
+                        watch_path = self.ensure_lc_watch_path()
+                if watch_path is not None and lc_path is not None:
+                    write_lc_watch_file(watch_path, lc_path)
+            except Exception as exc:
+                self.warn(f"LC refresh could not update watch file: {exc}")
+                lc_path = None
+
+        with self.live_lc_lock:
+            live_generation = generation == self.live_lc_generation
+            pending_refresh = self.live_lc_pending
+            if lc_path is not None and self.live_lc_enabled and live_generation:
+                self.last_lightcurve_path = lc_path
+                self.last_lightcurve_signature = signature
+                self.clear_spectrum_state()
+                self.next_extract = "spectrum"
+            elif self.live_lc_enabled and live_generation and not pending_refresh:
+                self.next_extract = "lightcurve"
+            should_start_pending = self.live_lc_enabled and live_generation and pending_refresh
+            self.live_lc_pending = False
+            self.live_lc_inflight = False
+
+        if lc_path is not None:
+            self.info("LC refreshed")
+
+        if should_start_pending:
+            delay = self.live_lc_min_interval - (time.monotonic() - started)
+            if delay > 0:
+                time.sleep(delay)
+            self.schedule_live_lc_refresh(force=True)
+
+    def warn(self, message: str, rows: list[tuple[str, object]] | tuple[tuple[str, object], ...] = ()) -> None:
+        terminal_warning(message, rows)
+
+    def region_rows(self) -> tuple[tuple[str, str], tuple[str, str]]:
+        src_desc = f"x={self.src_x + 1:.3f}, y={self.src_y + 1:.3f}, r={self.src_radius:.3f}"
+        if self.src_region_type == "annulus":
+            src_desc += f", ir={self.src_inner_radius:.3f}"
+        bkg_desc = f"x={self.bkg_x + 1:.3f}, y={self.bkg_y + 1:.3f}, r={self.bkg_radius:.3f}"
+        if self.bkg_region_type == "annulus":
+            bkg_desc += f", ir={self.bkg_inner_radius:.3f}"
+        return (("src", src_desc), ("bkg", bkg_desc))
+
+    def active_group(self) -> str | None:
+        return self.selected_group or self.hover_group
+
+    def centroid_source(self) -> None:
+        y_grid, x_grid = np.indices(self.counts.shape, dtype=float)
+        in_source = (x_grid - self.src_x) ** 2 + (y_grid - self.src_y) ** 2 <= self.src_radius**2
+        weights = np.asarray(self.counts, dtype=float)
+        usable = in_source & np.isfinite(weights) & (weights > 0)
+        if not np.any(usable):
+            self.warn("centroid skipped: no positive source pixels")
+            return
+
+        total = float(weights[usable].sum())
+        if total <= 0:
+            self.warn("centroid skipped: zero source weight")
+            return
+
+        new_x = float((x_grid[usable] * weights[usable]).sum() / total)
+        new_y = float((y_grid[usable] * weights[usable]).sum() / total)
+        old_x, old_y = self.src_x, self.src_y
+        self.set_source_center(new_x, new_y)
+        self.selected_group = "src"
+        self.hover_group = None
+        self.update_highlights()
+        self.on_region_changed(force_lc_refresh=True)
+        self.info(
+            "centroid",
+            (
+                ("source", f"({old_x + 1:.2f}, {old_y + 1:.2f}) -> ({self.src_x + 1:.2f}, {self.src_y + 1:.2f})"),
+                ("radius", f"{self.src_radius:.3f} px"),
+            ),
+            block=True,
+        )
+        self.fig.canvas.draw_idle()
+
+    def auto_background(self) -> None:
+        sig = (self.src_x, self.src_y, self.src_radius)
+        if not hasattr(self, "_bkg_candidates") or self._bkg_sig != sig:
+            bkg_radius = max(self.bkg_radius, 1.5 * self.src_radius)
+            try:
+                self._bkg_candidates = auto_background_candidates(
+                    self.counts, self.src_x, self.src_y, self.src_radius, bkg_radius,
+                )
+            except ValueError as exc:
+                self.warn(f"auto-background failed: {exc}")
+                return
+            self._bkg_sig = sig
+            self._bkg_idx = 0
+        else:
+            self._bkg_idx = (self._bkg_idx + 1) % len(self._bkg_candidates)
+
+        bx, by, score = self._bkg_candidates[self._bkg_idx]
+        n = len(self._bkg_candidates)
+        self.set_background_center(bx, by)
+        self.selected_group = "bkg"
+        self.hover_group = None
+        self.update_highlights()
+        self.on_region_changed(force_lc_refresh=True)
+        rank = self._bkg_idx + 1
+        rank_label = "best" if rank == 1 else ("worst" if rank == n else "")
+        rank_str = f"#{rank}/{n}" + (f" ({rank_label})" if rank_label else "")
+        self.info(
+            "auto background",
+            (
+                ("bkg", f"({self.bkg_x + 1:.2f}, {self.bkg_y + 1:.2f})"),
+                ("candidate", f"{rank_str}, score {score:.2f}"),
+            ),
+            block=True,
+        )
+        self.fig.canvas.draw_idle()
+
+    def set_source_center(self, x_center: float, y_center: float) -> None:
+        self.bounds = square_window_inside_frame(x_center, y_center, self.half_width, self.counts)
+        self.src_x, self.src_y = self.bounds_center()
+        self.set_patch_centers(self.src_patches, self.src_x, self.src_y)
+        self.src_highlight.center = (self.src_x, self.src_y)
+        self._update_inner_patches("src")
+        self.update_source_coord_text()
+        self.apply_bounds()
+
+    def set_background_center(self, x_center: float, y_center: float) -> None:
+        self.bkg_x, self.bkg_y = clamp_center(x_center, y_center, self.bkg_radius, self.counts)
+        self.set_patch_centers(self.bkg_patches, self.bkg_x, self.bkg_y)
+        self.bkg_highlight.center = (self.bkg_x, self.bkg_y)
+        self._update_inner_patches("bkg")
+        self.update_handles()
+
+    def set_source_radius(self, radius: float) -> None:
+        max_radius = 0.45 * min(self.counts.shape)
+        self.src_radius = min(max(radius, 2.0), max_radius)
+        if self.src_region_type == "annulus" and self.src_inner_radius >= self.src_radius - 1:
+            self.src_inner_radius = max(1.0, self.src_radius * 0.5)
+        self.half_width = self.src_radius * self.initial_zoom_factor
+        self.src_x, self.src_y = clamp_center(self.src_x, self.src_y, self.src_radius, self.counts)
+        self.bounds = square_window_inside_frame(self.src_x, self.src_y, self.half_width, self.counts)
+        self.src_x, self.src_y = self.bounds_center()
+        self.set_patch_centers(self.src_patches, self.src_x, self.src_y)
+        self.set_patch_radii(self.src_patches, self.src_radius)
+        self.src_highlight.center = (self.src_x, self.src_y)
+        self.src_highlight.radius = self.src_radius
+        self._update_inner_patches("src")
+        self.update_source_coord_text()
+        self.apply_bounds()
+
+    def set_background_radius(self, radius: float) -> None:
+        max_radius = 0.45 * min(self.counts.shape)
+        self.bkg_radius = min(max(radius, 2.0), max_radius)
+        if self.bkg_region_type == "annulus" and self.bkg_inner_radius >= self.bkg_radius - 1:
+            self.bkg_inner_radius = max(1.0, self.bkg_radius * 0.5)
+        self.set_patch_radii(self.bkg_patches, self.bkg_radius)
+        self.bkg_highlight.radius = self.bkg_radius
+        self._update_inner_patches("bkg")
+        self.set_background_center(self.bkg_x, self.bkg_y)
+
+    def set_center(self, x_center: float, y_center: float) -> None:
+        self.set_source_center(x_center, y_center)
+
+    def event_to_figure_xy(self, event) -> tuple[float, float]:
+        return tuple(self.fig.transFigure.inverted().transform((event.x, event.y)))
+
+    def event_to_data_xy(self, event) -> tuple[float, float]:
+        return tuple(self.ax.transData.inverted().transform((event.x, event.y)))
+
+    def set_main_window(self, x_center: float, y_center: float, side: float) -> None:
+        x_min, x_max = -0.5, self.counts.shape[1] - 0.5
+        y_min, y_max = -0.5, self.counts.shape[0] - 0.5
+        max_side = min(x_max - x_min, y_max - y_min)
+        side = min(max(side, 5.0), max_side)
+        half = 0.5 * side
+        x_center = min(max(x_center, x_min + half), x_max - half)
+        y_center = min(max(y_center, y_min + half), y_max - half)
+        self.ax.set_xlim(x_center - half, x_center + half)
+        self.ax.set_ylim(y_center - half, y_center + half)
+        self.ax.set_aspect("equal")
+        self.ax.set_box_aspect(1)
+        self.update_handles()
+
+    def set_inset_upper_right(self, x_right: float, y_top: float) -> None:
+        bbox = self.inset.get_position()
+        margin = 0.015
+        x0 = min(max(x_right - bbox.width, margin), 1.0 - margin - bbox.width)
+        y0 = min(max(y_top - bbox.height, margin), 1.0 - margin - bbox.height)
+        self.inset.set_position([x0, y0, bbox.width, bbox.height])
+        self.place_inset_handle()
+        self.update_connectors()
+
+    def apply_bounds(self) -> None:
+        x0, x1, y0, y1 = self.bounds
+        self.inset.set_xlim(x0, x1)
+        self.inset.set_ylim(y0, y1)
+        self.update_connectors()
+        self.update_handles()
+        self.update_highlights()
+        self.update_status_labels()
+
+    def gti_spectra_dir(self) -> Path:
+        return self.extraction_root() / NAMES.spec_workdir_name(self.eventfile) / "gti_spectra"
+
+    def _refresh_gti_status(self) -> None:
+        # GTI spectra are produced by the separate light-curve window process, so detect
+        # them from the filesystem. A ".extracting" marker (written by that process) means a
+        # run is in progress -> show white. Otherwise trust products newer than the most
+        # recent LC extraction (self._gti_baseline_ns) to ignore leftovers from a prior run.
+        if self.lc_status_sig is None:
+            self.gti_running = False
+            return
+        gti_dir = self.gti_spectra_dir()
+        self.gti_running = (gti_dir / ".extracting").exists()
+        if self.gti_running:
+            return
+        try:
+            products = [p for p in gti_dir.iterdir() if not p.name.startswith(".")] if gti_dir.is_dir() else []
+        except OSError:
+            products = []
+        if not products:
+            return
+        mtime = path_mtime_ns(gti_dir)
+        if mtime is None or mtime <= self._gti_baseline_ns:
+            return
+        if mtime != self._gti_seen_mtime:
+            self._gti_seen_mtime = mtime
+            # GTI uses the regions of the last LC extraction, so tie its freshness to that.
+            self.gti_status_sig = self.lc_status_sig
+
+    def update_status_labels(self) -> None:
+        current = self.current_extraction_signature()
+        visible_labels = []
+        for label, sig_attr, run_attr in self.status_labels:
+            running = getattr(self, run_attr)
+            sig = getattr(self, sig_attr)
+            if running:
+                color, alpha = "white", 0.9
+            elif sig is None:
+                label.set_visible(False)
+                continue
+            elif sig == current:
+                color, alpha = "lightgreen", 0.65
+            else:
+                color, alpha = "red", 0.9
+            label.set_visible(True)
+            label.set_color(color)
+            label.set_alpha(alpha)
+            visible_labels.append(label)
+        try:
+            renderer = self.fig.canvas.get_renderer()
+        except Exception:
+            return
+        title_bbox = self.ax.title.get_window_extent(renderer)
+        cursor_x = title_bbox.x1 + 6
+        title_cy = 0.5 * (title_bbox.y0 + title_bbox.y1)
+        inv = self.fig.transFigure.inverted()
+        gap = 5
+        for label in visible_labels:
+            fx, fy = inv.transform((cursor_x, title_cy))
+            label.set_position((fx, fy))
+            label.set_transform(self.fig.transFigure)
+            label.set_ha("left")
+            label.set_clip_on(False)
+            lbox = label.get_window_extent(renderer)
+            cursor_x = lbox.x1 + gap
+
+    def _flush_draw(self) -> None:
+        # Force a synchronous repaint so a "running" (white) label is shown before the
+        # blocking extraction freezes the GUI.
+        try:
+            self.fig.canvas.draw()
+            self.fig.canvas.flush_events()
+        except Exception:
+            pass
+
+    def _poll_status(self) -> bool:
+        if self.closed:
+            return False
+        before = (self.gti_status_sig, self._gti_seen_mtime, self.gti_running)
+        self._refresh_gti_status()
+        if (self.gti_status_sig, self._gti_seen_mtime, self.gti_running) != before:
+            self.update_status_labels()
+            self.fig.canvas.draw_idle()
+        return True
+
+    def pick_target(self, event) -> str | None:
+        if self.inset_move_handle is not None:
+            contains, _ = self.inset_move_handle.contains(event)
+            if contains:
+                return "inset_move"
+        if event.inaxes is not self.ax or event.xdata is None or event.ydata is None:
+            return None
+        handle_names = ["src_resize", "src_move", "bkg_resize", "bkg_move"]
+        if self.src_region_type == "annulus":
+            handle_names.insert(0, "src_inner_resize")
+        if self.bkg_region_type == "annulus":
+            handle_names.append("bkg_inner_resize")
+        for name in handle_names:
+            contains, _ = self.handles[name].contains(event)
+            if contains:
+                return name
+        if self.drag_region_body:
+            if self._region_body_contains("src", event.xdata, event.ydata):
+                return "src_move"
+            if self._region_body_contains("bkg", event.xdata, event.ydata):
+                return "bkg_move"
+        return None
+
+    def update_connectors(self) -> None:
+        for line in self.connectors:
+            line.remove()
+        self.connectors.clear()
+
+    def start_main_pan(self, event) -> None:
+        self.dragging = True
+        self.drag_target = "main_pan"
+        self.pan_start_px = (float(event.x), float(event.y))
+        self.pan_xlim = tuple(self.ax.get_xlim())
+        self.pan_ylim = tuple(self.ax.get_ylim())
+        self.selected_group = None
+        self.hover_group = None
+        self.update_highlights()
+        self.fig.canvas.draw_idle()
+
+    def on_press(self, event) -> None:
+        if any(button.contains(event) for button in self.overlay_buttons):
+            return  # handled by the button's own click callback
+        if event.inaxes is self.ax and event.button in (2, 3):
+            self.start_main_pan(event)
+            return
+        if event.button != 1:
+            return
+        target = self.pick_target(event)
+        if target is None:
+            if event.inaxes is self.ax:
+                self.start_main_pan(event)
+                return
+            self.selected_group = None
+            self.update_highlights()
+            self.fig.canvas.draw_idle()
+            return
+        if target == "inset_move":
+            x_fig, y_fig = self.event_to_figure_xy(event)
+            bbox = self.inset.get_position()
+            self.drag_offset = (x_fig - bbox.x1, y_fig - bbox.y1)
+        elif target == "bkg_move":
+            x_center, y_center = self.bkg_x, self.bkg_y
+            self.drag_offset = (event.xdata - x_center, event.ydata - y_center)
+        elif target == "src_move":
+            x_center, y_center = self.src_x, self.src_y
+            self.drag_offset = (event.xdata - x_center, event.ydata - y_center)
+        else:
+            x_center, y_center = event.xdata, event.ydata
+            self.drag_offset = (event.xdata - x_center, event.ydata - y_center)
+        self.dragging = True
+        self.drag_target = target
+        self.selected_group = self.handle_group(target)
+        self.hover_group = None
+        self.update_highlights()
+        self.fig.canvas.draw_idle()
+
+    def on_motion(self, event) -> None:
+        if not self.dragging:
+            self.hover_group = self.handle_group(self.pick_target(event))
+            self.update_highlights()
+            self.fig.canvas.draw_idle()
+            return
+        if self.drag_target == "main_pan":
+            x0, x1 = self.pan_xlim
+            y0, y1 = self.pan_ylim
+            side = max(abs(x1 - x0), abs(y1 - y0))
+            width_px = max(float(self.ax.bbox.width), 1.0)
+            height_px = max(float(self.ax.bbox.height), 1.0)
+            dx = (float(event.x) - self.pan_start_px[0]) * abs(x1 - x0) / width_px
+            dy = (float(event.y) - self.pan_start_px[1]) * abs(y1 - y0) / height_px
+            self.set_main_window(0.5 * (x0 + x1) - dx, 0.5 * (y0 + y1) - dy, side)
+            self.fig.canvas.draw_idle()
+            return
+        if self.drag_target == "inset_move":
+            x_fig, y_fig = self.event_to_figure_xy(event)
+            self.set_inset_upper_right(x_fig - self.drag_offset[0], y_fig - self.drag_offset[1])
+            self.fig.canvas.draw_idle()
+            return
+        if event.inaxes is not self.ax or event.xdata is None or event.ydata is None:
+            return
+        x_center = event.xdata - self.drag_offset[0]
+        y_center = event.ydata - self.drag_offset[1]
+        region_changed = False
+        if self.drag_target == "bkg_move":
+            self.set_background_center(x_center, y_center)
+            region_changed = True
+        elif self.drag_target == "src_move":
+            self.set_source_center(x_center, y_center)
+            region_changed = True
+        elif self.drag_target == "src_resize":
+            self.set_source_radius(max(abs(event.xdata - self.src_x), abs(event.ydata - self.src_y)))
+            region_changed = True
+        elif self.drag_target == "bkg_resize":
+            self.set_background_radius(max(abs(event.xdata - self.bkg_x), abs(event.ydata - self.bkg_y)))
+            region_changed = True
+        elif self.drag_target == "src_inner_resize":
+            dist = math.hypot(event.xdata - self.src_x, event.ydata - self.src_y)
+            self.src_inner_radius = max(1.0, min(dist, self.src_radius - 1.0))
+            self._update_inner_patches("src")
+            self.update_handles()
+            region_changed = True
+        elif self.drag_target == "bkg_inner_resize":
+            dist = math.hypot(event.xdata - self.bkg_x, event.ydata - self.bkg_y)
+            self.bkg_inner_radius = max(1.0, min(dist, self.bkg_radius - 1.0))
+            self._update_inner_patches("bkg")
+            self.update_handles()
+            region_changed = True
+        if region_changed:
+            self.on_region_changed()
+        self.fig.canvas.draw_idle()
+
+    def on_scroll(self, event) -> None:
+        if event.inaxes is not self.ax:
+            return
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        current_side = max(abs(x1 - x0), abs(y1 - y0))
+        scale = 1.0 / 1.2 if event.button == "up" else 1.2
+        self.set_main_window(0.5 * (x0 + x1), 0.5 * (y0 + y1), current_side * scale)
+        self.fig.canvas.draw_idle()
+
+    def on_release(self, event) -> None:  # noqa: ARG002
+        if self.drag_target in {"src_move", "src_resize", "src_inner_resize", "bkg_move", "bkg_resize", "bkg_inner_resize"}:
+            self.on_region_changed(force_lc_refresh=True)
+        self.dragging = False
+        self.drag_target = None
+        self.update_highlights()
+        self.fig.canvas.draw_idle()
+
+    def on_key(self, event) -> None:
+        if event.key == "s":
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.fig.savefig(
+                self.output,
+                dpi=self.dpi,
+                bbox_inches="tight",
+                pad_inches=0.03,
+                facecolor=self.fig.get_facecolor(),
+            )
+            self.info("saved frame", (("path", self.output), ("dpi", self.dpi)), block=True)
+        elif event.key == "q":
+            plt.close(self.fig)
+        elif event.key == "r":
+            self.ax.set_xlim(*self.initial_main_xlim)
+            self.ax.set_ylim(*self.initial_main_ylim)
+            self.inset.set_position(self.initial_inset_position)
+            self.set_source_radius(self.initial_src_radius)
+            self.set_background_radius(self.initial_bkg_radius)
+            self.half_width = self.src_radius * self.initial_zoom_factor
+            self.set_background_center(*self.initial_bkg)
+            self.set_source_center(*self.initial_src)
+            self.src_inner_radius = self.initial_src_inner_radius
+            self.bkg_inner_radius = self.initial_bkg_inner_radius
+            self.src_region_type = self.initial_src_region_type
+            self.bkg_region_type = self.initial_bkg_region_type
+            self._update_inner_patches("src")
+            self._update_inner_patches("bkg")
+            self.selected_group = None
+            self.hover_group = None
+            self.clear_extraction_state()
+            self.update_legend_labels()
+            self.update_highlights()
+            self.fig.canvas.draw_idle()
+        elif event.key == "e":
+            if self.next_extract == "spectrum":
+                self.extract_spectrum_and_report()
+            else:
+                self.extract_and_plot()
+        elif event.key == "c":
+            if self.active_group() == "src":
+                self.centroid_source()
+            elif self.active_group() == "bkg":
+                self.set_background_center(self.src_x, self.src_y)
+                self.on_region_changed(force_lc_refresh=True)
+                self.fig.canvas.draw_idle()
+            else:
+                self.warn("select a region first, then press c")
+        elif event.key == "b":
+            if self.active_group() == "bkg":
+                self.auto_background()
+            else:
+                self.warn("select background first, then press b")
+        elif event.key == "x":
+            self.open_xspec_for_current_spectrum()
+        elif event.key == "tab":
+            group = self.active_group()
+            if group in ("src", "bkg"):
+                self.cycle_region_type(group)
+            else:
+                self.warn("select a region first, then press tab")
+        elif event.key == "z":
+            self.toggle_inset_visibility()
+
+    def toggle_inset_visibility(self) -> None:
+        visible = not self.inset.get_visible()
+        self.inset.set_visible(visible)
+        if self.inset_move_handle is not None:
+            self.inset_move_handle.set_visible(visible)
+        self.inset_rect.set_visible(visible)
+        self.fig.canvas.draw_idle()
+
+    def cycle_region_type(self, group: str) -> None:
+        cur = self.src_region_type if group == "src" else self.bkg_region_type
+        idx = (self.REGION_TYPES.index(cur) + 1) % len(self.REGION_TYPES)
+        new_type = self.REGION_TYPES[idx]
+        if group == "src":
+            self.src_region_type = new_type
+            if new_type == "annulus" and self.src_inner_radius <= 0:
+                self.src_inner_radius = 0.5 * self.src_radius
+            elif new_type == "circle":
+                self.src_inner_radius = 0.0
+        else:
+            self.bkg_region_type = new_type
+            if new_type == "annulus" and self.bkg_inner_radius <= 0:
+                self.bkg_inner_radius = 0.5 * self.bkg_radius
+            elif new_type == "circle":
+                self.bkg_inner_radius = 0.0
+        self._update_inner_patches(group)
+        self.update_handles()
+        self.on_region_changed()
+        self.fig.canvas.draw_idle()
+
+    def extract_and_plot(self) -> None:
+        self.info("LC extraction", (("status", "running"), *self.region_rows()), block=True)
+        started = time.monotonic()
+        signature = self.current_extraction_signature()
+        self.lc_running = True
+        self.update_status_labels()
+        self._flush_draw()
+        try:
+            lc_path = extract_lightcurve_with_heasoft(
+                eventfile=self.eventfile,
+                project_dir=self.project_dir,
+                wcs=self.wcs,
+                src_x=self.src_x,
+                src_y=self.src_y,
+                src_radius=self.src_radius,
+                bkg_x=self.bkg_x,
+                bkg_y=self.bkg_y,
+                bkg_radius=self.bkg_radius,
+                src_inner_radius=self.src_inner_radius,
+                bkg_inner_radius=self.bkg_inner_radius,
+                lc_bin=self.lc_bin,
+                pha_min=self.pha_min,
+                pha_max=self.pha_max,
+                energy_filter=self.energy_filter,
+                extract_dir=self.extract_dir,
+                module_name=self.module_name,
+                modules_init=self.modules_init,
+            )
+        except Exception as exc:
+            self.lc_running = False
+            self.update_status_labels()
+            self.fig.canvas.draw_idle()
+            self.warn("LC extraction failed", (("elapsed", f"{time.monotonic() - started:.1f}s"), ("detail", exc)))
+            return
+
+        self.last_lightcurve_path = lc_path
+        self.last_lightcurve_signature = signature
+        self.lc_running = False
+        self.lc_status_sig = signature
+        self._gti_baseline_ns = time.time_ns()
+        self.gti_status_sig = None
+        self._gti_seen_mtime = None
+        self.update_status_labels()
+        self.fig.canvas.draw_idle()
+        self.clear_spectrum_state()
+        self.region_changed_notice_shown = False
+        self.next_extract = "spectrum"
+        if LIVE_LC_REFRESH:
+            try:
+                write_lc_watch_file(self.ensure_lc_watch_path(), lc_path)
+                with self.live_lc_lock:
+                    self.live_lc_enabled = True
+                    self.live_lc_pending = False
+                    self.live_lc_inflight = False
+                    self.live_lc_generation += 1
+            except Exception as exc:
+                self.warn(f"could not enable live light-curve refresh: {exc}")
+        self.info(
+            "LC ready",
+            (
+                ("elapsed", f"{time.monotonic() - started:.1f}s"),
+                ("file", lc_path),
+                ("next", "press e for spectrum"),
+            ),
+            block=True,
+        )
+        self.launch_lightcurve_window(lc_path)
+
+    def active_lightcurve_processes(self) -> list[subprocess.Popen]:
+        self.lightcurve_processes = [process for process in self.lightcurve_processes if process.poll() is None]
+        return self.lightcurve_processes
+
+    def lightcurve_window_is_open(self) -> bool:
+        return bool(self.active_lightcurve_processes())
+
+    def reopen_lightcurve_window_if_needed(self) -> bool:
+        signature = self.current_extraction_signature()
+        if (
+            self.last_lightcurve_path is None
+            or self.last_lightcurve_signature != signature
+            or not self.last_lightcurve_path.is_file()
+        ):
+            return False
+        if self.lightcurve_window_is_open():
+            return False
+        try:
+            write_lc_watch_file(self.ensure_lc_watch_path(), self.last_lightcurve_path)
+        except Exception as exc:
+            self.warn(f"could not refresh light-curve watch file: {exc}")
+        self.info(
+            "LC window",
+            (
+                ("status", "reopening"),
+                ("file", self.last_lightcurve_path),
+                ("next", "press e again for spectrum"),
+            ),
+            block=True,
+        )
+        self.launch_lightcurve_window(self.last_lightcurve_path)
+        return True
+
+    def run_grppha(self, src_pha: Path, min_counts: int) -> Path:
+        out = src_pha.with_name(f"{src_pha.stem}-g{min_counts}{src_pha.suffix}")
+        result = run_heasoft_command(
+            ["grppha", str(src_pha), f"!{out}", f"comm=group min {min_counts} & exit", "chatter=5"],
+            cwd=src_pha.parent,
+            stdin_text="",
+            module_name=self.module_name,
+            modules_init=self.modules_init,
+        )
+        require_success(result, "grppha")
+        if not out.is_file():
+            raise RuntimeError(f"grppha completed but output not found: {out}")
+        return out
+
+    def extract_spectrum_and_report(self) -> None:
+        if self.reopen_lightcurve_window_if_needed():
+            return
+        self.info("spectrum extraction", (("status", "running"), *self.region_rows()), block=True)
+        started = time.monotonic()
+        signature = self.current_extraction_signature()
+        if self.last_lightcurve_path is None or self.last_lightcurve_signature != signature:
+            with self.live_lc_lock:
+                live_refresh_running = self.live_lc_inflight
+            if live_refresh_running:
+                self.warn("light curve refresh is still running; wait for it to finish before extracting spectrum.")
+            else:
+                self.warn("no matching current light curve is available; press e to extract the light curve first.")
+            return
+        self.spec_running = True
+        self.update_status_labels()
+        self._flush_draw()
+        try:
+            mkf_file = None
+            if RESPONSE_FILES_MODE != "existing":
+                mkf_file = self.mkf_file or resolve_mkf_file(None, self.project_dir, self.eventfile)
+            products = extract_spectrum_with_heasoft(
+                eventfile=self.eventfile,
+                project_dir=self.project_dir,
+                mkf_file=mkf_file,
+                wcs=self.wcs,
+                src_x=self.src_x,
+                src_y=self.src_y,
+                src_radius=self.src_radius,
+                bkg_x=self.bkg_x,
+                bkg_y=self.bkg_y,
+                bkg_radius=self.bkg_radius,
+                src_inner_radius=self.src_inner_radius,
+                bkg_inner_radius=self.bkg_inner_radius,
+                extract_dir=self.extract_dir,
+                psfcor=self.psfcor,
+                module_name=self.module_name,
+                modules_init=self.modules_init,
+            )
+        except Exception as exc:
+            self.spec_running = False
+            self.update_status_labels()
+            self.fig.canvas.draw_idle()
+            self.warn("spectrum extraction failed", (("elapsed", f"{time.monotonic() - started:.1f}s"), ("detail", exc)))
+            return
+
+        for mc in (3, 20):
+            try:
+                self.run_grppha(products["src_pha"], mc)
+            except Exception as exc:
+                self.warn(f"grppha rebin {mc} failed", (("detail", exc),))
+
+        self.last_spectrum_products = products
+        self.last_spectrum_signature = signature
+        self.spec_running = False
+        self.spec_status_sig = signature
+        self.update_status_labels()
+        self.fig.canvas.draw_idle()
+        self.region_changed_notice_shown = False
+        self.info(
+            "spectrum ready",
+            (
+                ("elapsed", f"{time.monotonic() - started:.1f}s"),
+                ("workdir", products["workdir"]),
+                ("next", "press x to open XSPEC"),
+            ),
+            block=True,
+        )
+
+    def launch_lightcurve_window(self, lc_path: Path) -> None:
+        # A (re)extraction replaces the previous LC window: close any open one first so
+        # the new window supersedes it instead of stacking up.
+        if self.lightcurve_processes:
+            self.terminate_processes(self.lightcurve_processes)
+            self.lightcurve_processes = []
+        title = f"{self.eventfile.name} corrected light curve"
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--plot-lc",
+            str(lc_path),
+            "--plot-title",
+            title,
+            "--lc-bin",
+            f"{self.lc_bin:g}",
+            "--heasoft-mode",
+            HEASOFT_MODE,
+            "--module",
+            self.module_name,
+            *(("--config", CONFIG_PATH) if CONFIG_PATH else ()),
+            "--modules-init",
+            self.modules_init,
+            "--lc-eventfile",
+            str(self.eventfile),
+            "--lc-project-dir",
+            str(self.project_dir),
+            "--psfcor",
+            f"{self.psfcor:g}",
+        ]
+        if RESPONSE_FILES_MODE != "existing":
+            try:
+                mkf_file = self.mkf_file or resolve_mkf_file(None, self.project_dir, self.eventfile)
+                command.extend(["--lc-mkf", str(mkf_file)])
+            except Exception:
+                pass
+        if self.live_lc_enabled and self.lc_watch_path is not None:
+            command.extend(["--watch-lc", str(self.lc_watch_path)])
+        env = os.environ.copy()
+        env["DS8_FRAME_PLOT_INTERACTIVE"] = "1"
+        try:
+            process = subprocess.Popen(command, env=env, close_fds=True, start_new_session=True)
+        except Exception as exc:
+            self.warn(f"could not open light curve window: {exc}")
+            return
+        self.lightcurve_processes.append(process)
+        self.active_lightcurve_processes()
+
+    def terminate_processes(self, processes: list[subprocess.Popen]) -> None:
+        alive = [process for process in processes if process.poll() is None]
+        for process in alive:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except Exception:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+        for process in alive:
+            try:
+                process.wait(timeout=0.6)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    def close_child_windows(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if getattr(self, "status_timer", None) is not None:
+            try:
+                self.status_timer.stop()
+            except Exception:
+                pass
+        with self.live_lc_lock:
+            self.live_lc_enabled = False
+            self.live_lc_pending = False
+            self.live_lc_generation += 1
+        self.terminate_processes(self.lightcurve_processes)
+        self.terminate_processes(self.xspec_processes)
+
+    def on_close(self, event) -> None:  # noqa: ARG002
+        self.close_child_windows()
+
+    def open_xspec_for_current_spectrum(self) -> None:
+        signature = self.current_extraction_signature()
+        if self.last_lightcurve_path is None or not self.last_lightcurve_path.is_file():
+            self.warn("no current light curve is available; press e to extract the light curve first.")
+            return
+        if self.last_lightcurve_signature != signature:
+            self.warn("the current regions no longer match the generated light curve; press e to regenerate products.")
+            return
+        if self.last_spectrum_products is None:
+            self.warn("no spectrum products are available for the current light curve; press e again to extract spectrum.")
+            return
+        if self.last_spectrum_signature != self.last_lightcurve_signature:
+            self.warn("the generated spectrum does not match the current light curve; regenerate the spectrum before opening XSPEC.")
+            return
+
+        required = ("src_pha", "bkg_pha", "rmf", "arf")
+        missing = [key for key in required if not self.last_spectrum_products[key].is_file()]
+        if missing:
+            names = ", ".join(missing)
+            self.warn(f"spectrum products are missing ({names}); press e again to regenerate spectrum.")
+            return
+
+        helper = Path(__file__).resolve().with_name("xspec_init")
+        command = [str(helper) if helper.is_file() else "xspec_init"]
+        command.extend(
+            [
+                str(self.last_spectrum_products["workdir"]),
+                "--data",
+                str(self.last_spectrum_products["src_pha"]),
+                "--background",
+                str(self.last_spectrum_products["bkg_pha"]),
+                "--rmf",
+                str(self.last_spectrum_products["rmf"]),
+                "--arf",
+                str(self.last_spectrum_products["arf"]),
+                "-r",
+                "3",
+            ]
+        )
+        if SOURCE_ID is not None:
+            command.extend(["--source", str(SOURCE_ID)])
+        if CONFIG_PATH:
+            command.extend(["--config", CONFIG_PATH])
+        self.info("XSPEC", (("status", "opening"), ("workdir", self.last_spectrum_products["workdir"])), block=True)
+        shell_parts: list[str] = []
+        if HEASOFT_MODE == "module":
+            init = Path(self.modules_init).expanduser()
+            if not init.is_file():
+                self.warn(f"--heasoft-mode=module but the Environment Modules init file was not found: {init}")
+                return
+            shell_parts.extend(
+                [
+                    f". {shlex.quote(str(init))}",
+                    f"module load {shlex.quote(self.module_name)}",
+                ]
+            )
+        elif not os.environ.get("HEADAS"):
+            self.warn("$HEADAS is not set; cannot launch XSPEC in headas mode. Source your fxtsoft headas-init.sh, or set mode=module.")
+            return
+        shell_parts.append(f"exec {shlex.join(command)}")
+        suspend_terminal_hints()
+        try:
+            process = subprocess.Popen(
+                ["bash", "-lc", "; ".join(shell_parts)],
+                cwd=self.last_spectrum_products["workdir"],
+                close_fds=True,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            resume_terminal_hints()
+            self.warn(f"could not launch xspec_init: {exc}")
+            return
+        self.xspec_processes.append(process)
+        self.xspec_processes = [item for item in self.xspec_processes if item.poll() is None]
+
+        def resume_after_xspec() -> None:
+            process.wait()
+            resume_terminal_hints()
+
+        threading.Thread(target=resume_after_xspec, daemon=True).start()
+
+
+def build_viewer(args: argparse.Namespace):
+    eventfile, project_dir = resolve_event_file(args.path, args.detector)
+    src_reg = resolve_region(args.src_reg, project_dir)
+    bkg_reg = resolve_region(args.bkg_reg, project_dir)
+    output = Path(args.output).expanduser().resolve() if args.output else default_output_path(eventfile, project_dir)
+    mkf_file = resolve_optional_mkf(args.mkf, project_dir)
+    if mkf_file is not None and not mkf_file.is_file():
+        raise FileNotFoundError(f"MKF file not found: {mkf_file}")
+
+    frame = load_frame(eventfile, "EVENTS", "X", "Y", spatial_bin=args.spatial_bin)
+    ny, nx = frame.counts.shape
+    counts = frame.counts
+    cx, cy = 0.5 * (nx - 1), 0.5 * (ny - 1)
+    default_radius = 0.03 * min(nx, ny)
+
+    def _load_region(reg_path, label):
+        try:
+            return (
+                region_to_pixel(
+                    parse_region_file(reg_path, label),
+                    frame.wcs,
+                    x_low=frame.x_low,
+                    y_low=frame.y_low,
+                    spatial_bin=frame.spatial_bin,
+                ),
+                True,
+            )
+        except FileNotFoundError:
+            terminal_warning(f"region file not found, placing {label} at image center", (("path", reg_path),))
+            return PixelCircle(label, cx, cy, default_radius), False
+
+    src_region, src_region_found = _load_region(src_reg, src_reg.name)
+    bkg_region, bkg_region_found = _load_region(bkg_reg, bkg_reg.name)
+    if INSTRUMENT_NAME == "wxt" and not bkg_region_found:
+        if src_region_found:
+            bx = src_region.x + max(3.0 * src_region.radius, default_radius)
+            by = src_region.y
+        else:
+            bx = cx + 3.0 * default_radius
+            by = cy
+        bx, by = clamp_center(bx, by, bkg_region.radius, counts)
+        bkg_region = PixelCircle(bkg_region.label, bx, by, bkg_region.radius)
+    src_circle = PixelCircle(src_region.label, src_region.x, src_region.y, src_region.radius) if isinstance(src_region, PixelAnnulus) else src_region
+    bkg_circle = PixelCircle(bkg_region.label, bkg_region.x, bkg_region.y, bkg_region.radius) if isinstance(bkg_region, PixelAnnulus) else bkg_region
+    masked_counts = np.ma.masked_less_equal(counts, 0)
+
+    cmap = resolve_cmap(args.cmap)
+    cmap.set_bad("black")
+    cmap.set_under("black")
+    norm = log_norm_for(counts)
+
+    fig = plt.figure(figsize=(8.2, 7.4), facecolor="black")
+    ax = fig.add_subplot(111, projection=frame.wcs) if frame.wcs is not None else fig.add_subplot(111)
+    fig.subplots_adjust(left=0.10, right=0.88, bottom=0.09, top=0.92)
+    apply_ds9_axes_style(ax)
+    image = ax.imshow(masked_counts, origin="lower", cmap=cmap, norm=norm, interpolation="nearest")
+    src_main_patches = draw_region(ax, src_circle, "red")
+    bkg_main_patches = draw_region(ax, bkg_circle, "cyan")
+    main_x0, main_x1, main_y0, main_y1 = display_limits_for(counts, (src_circle, bkg_circle), args.main_size)
+    ax.set_xlim(main_x0, main_x1)
+    ax.set_ylim(main_y0, main_y1)
+    ax.set_aspect("equal")
+    ax.set_box_aspect(1)
+    configure_wcs_axes(ax)
+    add_main_axes_frame(ax)
+    ax.legend(loc="upper left", frameon=False, labelcolor="white")
+    ax.set_title(
+        f"{frame.event_header.get('DETNAM', '').strip()} {frame.event_header.get('OBJECT', eventfile.name).strip()}",
+        color="white",
+        pad=22,
+    )
+
+    cbar = fig.colorbar(image, ax=ax, pad=0.02, fraction=0.046)
+    cbar.set_label("Counts / pixel")
+    cbar.ax.yaxis.label.set_color("white")
+    cbar.ax.tick_params(colors="white")
+    cbar.outline.set_edgecolor("white")
+
+    ax_box = ax.get_position()
+    inset_size = min(ax_box.width, ax_box.height) * 0.36
+    inset_margin = min(ax_box.width, ax_box.height) * 0.06
+    inset_rect = [ax_box.x1 - inset_size - inset_margin, ax_box.y1 - inset_size - inset_margin, inset_size, inset_size]
+    inset = fig.add_axes(inset_rect, projection=frame.wcs) if frame.wcs is not None else fig.add_axes(inset_rect)
+    apply_ds9_axes_style(inset)
+    inset.imshow(masked_counts, origin="lower", cmap=cmap, norm=norm, interpolation="nearest")
+    src_inset_patches = draw_region(inset, src_circle, "red")
+    bkg_inset_patches = draw_region(inset, bkg_circle, "cyan")
+    inset.set_aspect("equal")
+    inset.set_box_aspect(1)
+    inset.set_title("Source zoom", fontsize=9, color="white")
+    inset.tick_params(labelsize=7)
+    if hasattr(inset, "coords"):
+        inset.coords[0].set_ticklabel(size=7, color="white")
+        inset.coords[1].set_ticklabel(size=7, color="white")
+        inset.coords[0].set_ticks(color="white")
+        inset.coords[1].set_ticks(color="white")
+        inset.coords[0].set_axislabel("")
+        inset.coords[1].set_axislabel("")
+
+    controller = InteractiveZoom(
+        fig=fig,
+        ax=ax,
+        inset=inset,
+        counts=counts,
+        wcs=frame.wcs,
+        eventfile=eventfile,
+        project_dir=project_dir,
+        src_reg=src_reg,
+        bkg_reg=bkg_reg,
+        src_circle=src_circle,
+        bkg_circle=bkg_circle,
+        src_region=src_region,
+        bkg_region=bkg_region,
+        src_patches=(*src_main_patches, *src_inset_patches),
+        bkg_patches=(*bkg_main_patches, *bkg_inset_patches),
+        zoom_factor=args.zoom_factor,
+        output=output,
+        dpi=args.dpi,
+        lc_bin=args.lc_bin,
+        pha_min=args.pha_min,
+        pha_max=args.pha_max,
+        energy_filter=ENERGY_FILTER,
+        extract_dir=args.extract_dir,
+        module_name=args.module,
+        modules_init=args.modules_init,
+        mkf_file=mkf_file,
+        psfcor=args.psfcor,
+        drag_region_body=args.drag_region_body,
+    )
+    return fig, controller, eventfile, src_reg, bkg_reg, output
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    # Fix the HEASOFT invocation mode for the whole run (and for the forked LC window,
+    # which re-enters main() with --heasoft-mode forwarded). Any value other than
+    # "module" is treated as the default "headas" mode.
+    global HEASOFT_MODE, NAMES, CONFIG_PATH, INSTRUMENT_NAME, RESPONSE_FILES_MODE, ENERGY_FILTER, SOURCE_ID
+    HEASOFT_MODE = "module" if args.heasoft_mode == "module" else "headas"
+    NAMES = IONames.from_config(getattr(args, "_config", None))
+    INSTRUMENT_NAME = instrument_name_from_config(getattr(args, "_config", None) or {})
+    RESPONSE_FILES_MODE = response_files_mode_from_config(getattr(args, "_config", None) or {}, INSTRUMENT_NAME)
+    ENERGY_FILTER = energy_filter_from_config(getattr(args, "_config", None) or {}, INSTRUMENT_NAME)
+    SOURCE_ID = source_id_from_config(getattr(args, "_config", None) or {}, INSTRUMENT_NAME)
+    args.spatial_bin = max(1, args.spatial_bin)
+    CONFIG_PATH = args.config
+
+    if args.plot_lc:
+        set_terminal_hints("=/- 1s  ctrl+/- 10s  cmd+/- 100s  |  g=GTI  drag=select  enter=extract  u=undo  esc=clear")
+        backend = plt.get_backend().lower()
+        if backend in {"agg", "pdf", "ps", "svg", "template"}:
+            terminal_error(
+                "Matplotlib backend cannot open a light curve window",
+                (("backend", plt.get_backend()),),
+            )
+            return 2
+        try:
+            lc_path = Path(args.plot_lc).expanduser().resolve()
+            lc_eventfile = Path(args.lc_eventfile).expanduser().resolve() if args.lc_eventfile else None
+            lc_project_dir = Path(args.lc_project_dir).expanduser().resolve() if args.lc_project_dir else None
+            lc_mkf = Path(args.lc_mkf).expanduser().resolve() if args.lc_mkf else None
+            if args.watch_lc:
+                plot_lightcurve_watch(
+                    lc_path,
+                    Path(args.watch_lc).expanduser().resolve(),
+                    args.plot_title,
+                    args.lc_bin,
+                    args.module,
+                    args.modules_init,
+                    lc_eventfile,
+                    lc_project_dir,
+                    lc_mkf,
+                    args.psfcor,
+                )
+            else:
+                plot_lightcurve(
+                    lc_path,
+                    args.plot_title,
+                    args.lc_bin,
+                    args.module,
+                    args.modules_init,
+                    lc_eventfile,
+                    lc_project_dir,
+                    lc_mkf,
+                    args.psfcor,
+                )
+            terminal_block(
+                "LC window",
+                (
+                    ("file", lc_path),
+                    ("bin", format_lc_bin(args.lc_bin)),
+                ),
+            )
+        except Exception as exc:
+            terminal_error(str(exc))
+            return 1
+        plt.show()
+        return 0
+
+    set_terminal_hints("e=LC/spec  x=XSPEC  c=centroid  b=auto-bkg  tab=type  z=zoom  s=save  r=reset  q=quit")
+
+    try:
+        fig, controller, eventfile, src_reg, bkg_reg, output = build_viewer(args)
+    except Exception as exc:
+        terminal_error(str(exc))
+        return 1
+
+    terminal_block(
+        "viewer ready",
+        (
+            ("event", eventfile),
+            ("src reg", src_reg),
+            ("bkg reg", bkg_reg),
+            ("save", output),
+        ),
+    )
+
+    if args.dry_run:
+        x0, x1, y0, y1 = controller.bounds
+        terminal_block(
+            "dry run",
+            (
+                ("zoom xlim", f"({x0:.6g}, {x1:.6g})"),
+                ("zoom ylim", f"({y0:.6g}, {y1:.6g})"),
+            ),
+        )
+        return 0
+
+    backend = plt.get_backend().lower()
+    if backend in {"agg", "pdf", "ps", "svg", "template"}:
+        terminal_error(
+            "Matplotlib backend cannot open an interactive window",
+            (
+                ("backend", plt.get_backend()),
+                ("hint", "run from a graphical terminal or set MPLBACKEND=MacOSX/QtAgg"),
+            ),
+        )
+        return 2
+
+    plt.show()
+    controller.close_child_windows()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
