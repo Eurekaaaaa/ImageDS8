@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-EP/FXT 交互式选源工具：拖动源 / 背景圆 → 取光变 → 划 GTI → 取能谱 → 调起 XSPEC。
+EP/FXT 交互式选源工具：拖动区域 → 取光变 → 取能谱 → 调起 XSPEC。
 
 ```
 bin/  ds8  ds8_frame_plot.py  ds8_io_names.py  xspec_init  ds8-{fxt,wxt}.toml
@@ -11,40 +11,62 @@ set_headas.sh   README.md   CN_README.md
 
 ## 依赖
 
-- **Python ≥ 3.11**：`pip install "numpy>=1.24,<3" "matplotlib>=3.7" "astropy>=5.3"`。低于 3.11 无法读 TOML 配置（`tomllib`）。
-- **fxtsoft**（含 HEASOFT）+ **EP/FXT CALDB**，提供 `xselect` `lcurve` `lcmath` `grppha` `xspec` `fxt{rmf,expo,arf}gen`。
+- **Python ≥ 3.11**，需 **numpy**、**matplotlib**、**astropy**：
+
+  ```bash
+  # pip —— 装进当前激活的 venv / 解释器
+  pip install "numpy>=1.24,<3" "matplotlib>=3.7" "astropy>=5.3"
+  # conda —— 新建名为 ds8 的环境
+  conda create -n ds8 python=3.12 "numpy>=1.24,<3" matplotlib astropy
+  conda activate ds8
+  # pixi —— 全局环境，把 python3 暴露到 PATH
+  pixi global install --environment ds8 --expose python3 python=3.12 numpy matplotlib astropy
+  ```
+- **fxtdas**（IHEP 的 EP/FXT 数据处理软件包：https://epfxt.ihep.ac.cn/analysis ）
+- **CALDB**（需注册 EP 仪器，详见 fxtdas 手册）
 
 ## 安装与环境
 
-`bin/` 内 6 个文件须同目录（主程序按同目录定位其余脚本与配置模板）。ImageDS8 默认 **headas 模式**——直接用 `$HEADAS` 与 PATH 上的工具，无需 Environment Modules。
+`bin/` 内 6 个文件须同目录（主程序按同目录定位其余脚本与配置模板）。
+
+ImageDS8 默认 **headas 模式**——直接用 `$HEADAS`、`$CALDB` 以及 PATH 上的工具。
+
+运行前先 source 你要用的 HEASOFT 版本，或者：
 
 ```bash
 export PATH="/path/to/ImageDS8/bin:$PATH"
-# 编辑 set_headas.sh 里的 HEADAS / CALDB 两处路径，然后：
-source /path/to/set_headas.sh        # fxtsoft(HEASOFT) + CALDB
-conda activate fxt                   # 或 source <venv>/bin/activate —— Python 依赖
+# 编辑 set_headas.sh 里的 HEADAS / CALDB 路径，然后：
+source /path/to/set_headas.sh        # fxtsoft (HEASOFT) + CALDB
 ```
 
 ## 用法
 
 ```bash
-ds8 <观测目录> --inst fxt        # 首次：向该目录写入 ds8-fxt.toml；默认 FXTB，--detector a 取 FXTA
-ds8 <观测目录> --inst wxt        # WXT
-ds8 <观测目录>                   # 之后：自动识别目录内配置
+ds8 <观测目录> --inst fxt         # 在当前目录启动 ds8，并生成默认 fxt 配置文件
+ds8 <观测目录> --inst wxt         # 在当前目录启动 ds8，并生成默认 wxt 配置文件
+ds8 <观测目录> --inst fxt --directory <dir>         # 在指定目录启动
 ```
 
 图像窗口：
 
 | 键 | 作用 |
 |---|---|
-| 拖动 | 移动 / 缩放 源圈、背景圈 |
-| `e` | 主窗口：一按取光变，再按取能谱 |
+| 拖动手柄 | 移动 / 缩放 源圈、背景圈 |
+| `e` | 提取光变 / 能谱 |
 | `x` | 用当前能谱打开 XSPEC |
 | `c` / `b` | 源质心定位 / 背景自动选点 |
-| `Tab` | 圆 ↔ 环 |
+| `Tab` | 切换区域类型：圆 ↔ 环 |
 | `s` / `r` / `q` | 存 PNG / 重置 / 退出 |
 
-光变窗口：`=` `-` 调 bin（`Ctrl` ×10、`Cmd` ×100）；`g` 进 GTI，拖选区间后 `Enter` 取谱，`u` 撤销 / `Esc` 取消。
+光变窗口：
+
+| 键 | 作用 |
+|---|---|
+| `=` / `-` | 调 bin（`Ctrl` ×10、`Cmd` ×100） |
+| `g` | 进入 GTI 模式 |
+| 点击 - 拖动 | 选择时间区间 |
+| `Enter` | 按所选区间取谱 |
+| `u` / `Esc` | 撤销上一段 / 取消 |
 
 ## 配置
 

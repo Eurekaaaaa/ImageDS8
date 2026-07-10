@@ -12,41 +12,62 @@ set_headas.sh   README.md   CN_README.md
 
 ## Prerequisites
 
-- **Python ≥ 3.11** 
-- **fxtdas** (bundled EP/FXT data reductin package by IHEP: https://epfxt.ihep.ac.cn/analysis )
+- **Python ≥ 3.11** with **numpy**, **matplotlib**, **astropy**:
+
+  ```bash
+  # pip — into the active venv / interpreter
+  pip install "numpy>=1.24,<3" "matplotlib>=3.7" "astropy>=5.3"
+  # conda — new env named ds8
+  conda create -n ds8 python=3.12 "numpy>=1.24,<3" matplotlib astropy
+  conda activate ds8
+  # pixi — global env, exposes python3 on PATH
+  pixi global install --environment ds8 --expose python3 python=3.12 numpy matplotlib astropy
+  ```
+- **fxtdas** (bundled EP/FXT data reduction package by IHEP: https://epfxt.ihep.ac.cn/analysis )
 - **CALDB** (require register of EP instruments. see fxtdas manual)
 
 ## Install & environment
 
-Keep the 6 files in `bin/` together (the main script locates the other scripts and the config templates relative to itself). ImageDS8 defaults to **headas mode** — it uses `$HEADAS` and the tools on `PATH`, no Environment Modules needed.
+Keep the 6 files in `bin/` together (the main script locates the other scripts and the config templates relative to itself). 
+
+ImageDS8 defaults to **headas mode** — it uses `$HEADAS` , `$CALDB` and the tools on `PATH`. 
+
+Either source your desired HEASOFT version in prior to run, or: 
 
 ```bash
 export PATH="/path/to/ImageDS8/bin:$PATH"
 # Edit the HEADAS / CALDB paths in set_headas.sh, then:
 source /path/to/set_headas.sh        # fxtsoft (HEASOFT) + CALDB
-conda activate fxt                   # or source <venv>/bin/activate — Python deps
 ```
 
 ## Usage
 
 ```bash
-ds8 <obsdir> --inst fxt         # first run: writes ds8-fxt.toml there; FXTB by default, --detector a for FXTA
-ds8 <obsdir> --inst wxt         # WXT
-ds8 <obsdir>                    # afterwards: the config in the dir is picked up automatically
+ds8 <obsdir> --inst fxt         # Launch ds8 at current directory and create a default fxt configuration file. 
+ds8 <obsdir> --inst wxt         # Launch ds8 at current directory and create a default wxt configuration file. 
+ds8 <obsdir> --inst fxt --directory <dir>         # Launch at given directory
 ```
 
 Image window:
 
 | Key | Action |
 |---|---|
-| drag | move / resize source & background circles |
-| `e` | main window: first press extracts the light curve, second the spectrum |
-| `x` | open XSPEC with the current spectrum |
+| drag knobs | move and resize source & background circles |
+| `e` | extracts the light curve / spectrum |
+| `x` | open XSPEC with an current spectrum |
 | `c` / `b` | centroid source / auto-pick background |
-| `Tab` | circle ↔ annulus |
+| `Tab` | toggle region type: circle ↔ annulus |
 | `s` / `r` / `q` | save PNG / reset / quit |
 
-Light-curve window: `=` `-` change bin (`Ctrl` ×10, `Cmd` ×100); `g` enters GTI mode, drag to select intervals then `Enter` to extract, `u` undo / `Esc` cancel.
+Light-curve window:
+
+| Key | Action |
+|---|---|
+| `=` / `-` | change bin (`Ctrl` ×10, `Cmd` ×100) |
+| `g` | enter GTI mode |
+| click - drag | select time intervals |
+| `Enter` | extract selected intervals |
+| `u` / `Esc` | undo last interval / cancel |
 
 ## Configuration
 
