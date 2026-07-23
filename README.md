@@ -43,10 +43,12 @@ source /path/to/set_headas.sh        # fxtsoft (HEASOFT) + CALDB
 ## Usage
 
 ```bash
-ds8 <obsdir> --inst fxt         # Launch ds8 at current directory and create a default fxt configuration file. 
-ds8 <obsdir> --inst wxt         # Launch ds8 at current directory and create a default wxt configuration file. 
-ds8 <obsdir> --inst fxt --directory <dir>         # Launch at given directory
+ds8 <obsdir> --inst fxt         # Scaffold only: write ds8-fxt.toml into <obsdir> and exit (does not launch).
+ds8 <obsdir> --inst wxt         # Scaffold only: write ds8-wxt.toml into <obsdir> and exit.
+ds8 <obsdir>                    # Launch: requires an existing ds8*.toml in <obsdir> (errors if missing).
 ```
+
+`--inst` never launches and never overwrites an existing `ds8-<inst>.toml`. Edit the generated copy, then run `ds8 <obsdir>` to launch. The bundled templates in `bin/` are only ever copied out this way; they never drive a running session.
 
 Image window:
 
@@ -71,11 +73,11 @@ Light-curve window:
 
 ## Configuration
 
-One `ds8-<inst>.toml` per obs dir (created from the template on first run; edit the copy). Common CLI (`-h` for all):
+One `ds8-<inst>.toml` per obs dir. Create it with `ds8 --inst <inst> <dir>` (writes the template and exits), edit the copy, then run `ds8 <dir>`. Common CLI (`-h` for all):
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--inst {fxt,wxt}` | inferred from the dir config | selects the template on first run |
+| `--inst {fxt,wxt}` | — | scaffold only: write `ds8-<inst>.toml` into PATH's dir and exit; never launches |
 | `--detector {a,b}` | `b` | FXT detector |
 | `--lc-bin` | `100` | light-curve bin (s) |
 | `--pha-min` / `--pha-max` | `38` / `925` | light-curve PHA channels (spectra are not limited by this) |

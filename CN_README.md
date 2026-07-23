@@ -42,10 +42,12 @@ source /path/to/set_headas.sh        # fxtsoft (HEASOFT) + CALDB
 ## 用法
 
 ```bash
-ds8 <观测目录> --inst fxt         # 在当前目录启动 ds8，并生成默认 fxt 配置文件
-ds8 <观测目录> --inst wxt         # 在当前目录启动 ds8，并生成默认 wxt 配置文件
-ds8 <观测目录> --inst fxt --directory <dir>         # 在指定目录启动
+ds8 <观测目录> --inst fxt         # 仅生成：向 <观测目录> 写入 ds8-fxt.toml 后退出（不启动）
+ds8 <观测目录> --inst wxt         # 仅生成：向 <观测目录> 写入 ds8-wxt.toml 后退出（不启动）
+ds8 <观测目录>                    # 启动：要求 <观测目录> 里已有 ds8*.toml（缺失则报错）
 ```
+
+`--inst` 从不启动，也从不覆盖已存在的 `ds8-<inst>.toml`。编辑生成的副本后，再用 `ds8 <观测目录>` 启动。`bin/` 里的捆绑模板只会以这种方式复制出去，绝不直接驱动任何运行中的会话。
 
 图像窗口：
 
@@ -70,11 +72,11 @@ ds8 <观测目录> --inst fxt --directory <dir>         # 在指定目录启动
 
 ## 配置
 
-每个观测目录一份 `ds8-<inst>.toml`（首次运行由模板生成，按需改副本）。常用 CLI（`-h` 看全部）：
+每个观测目录一份 `ds8-<inst>.toml`。用 `ds8 --inst <inst> <目录>` 生成（写入模板后退出），编辑副本，再用 `ds8 <目录>` 启动。常用 CLI（`-h` 看全部）：
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--inst {fxt,wxt}` | 由目录配置推断 | 首次生成配置用 |
+| `--inst {fxt,wxt}` | — | 仅生成：向 PATH 所在目录写入 `ds8-<inst>.toml` 后退出，不启动 |
 | `--detector {a,b}` | `b` | FXT 探测器 |
 | `--lc-bin` | `100` | 光变 bin（秒） |
 | `--pha-min` / `--pha-max` | `38` / `925` | 光变 PHA 通道（能谱不受此限） |

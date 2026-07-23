@@ -373,32 +373,42 @@ def resolve_startup_config(inst: str | None, explicit_config: str | None, path_t
         return path, config
 
     work_dir = config_work_dir(path_text)
+
+    # --inst is a scaffold-only command: copy the bundled template into the target
+    # directory and exit. The template only ever gets distributed this way -- it never
+    # controls a running session. Edit the copy, then `ds8 <dir>` runs off that copy.
+    if inst is not None:
+        if not work_dir.is_dir():
+            config_startup_error(f"target directory not found: {work_dir}")
+        target = work_dir / f"ds8-{inst}.toml"
+        if target.exists():
+            config_startup_error(f"config already exists, not overwriting: {target}")
+        template = template_config_path(inst)
+        if not template.is_file():
+            config_startup_error(f"template config not found for --inst {inst}: {template}")
+        shutil.copyfile(template, target)
+        terminal_block(
+            "config created",
+            (("path", target), ("instrument", inst)),
+            (f"edit it, then run:  ds8 {path_text or '.'}",),
+        )
+        raise SystemExit(0)
+
+    # Run mode requires exactly one dir-local ds8*.toml; the bundled template is never
+    # used as a live config.
     if not work_dir.is_dir():
         config_startup_error(f"config directory not found: {work_dir}")
-
     candidates = sorted(work_dir.glob("ds8*.toml"))
     if len(candidates) > 1:
         names = ", ".join(path.name for path in candidates)
         config_startup_error(f"ambiguous ds8 TOML files in {work_dir}: {names}")
-
-    if candidates:
-        path = candidates[0].resolve()
-        config = load_config_strict(path)
-        config_inst = instrument_name_from_config(config)
-        if inst is not None and config_inst != inst:
-            config_startup_error(f"--inst {inst} does not match config instrument {config_inst!r}: {path}")
-        return path, config
-
-    if inst is None:
-        config_startup_error(f"no ds8 TOML found in {work_dir}; use --inst fxt or --inst wxt to create one")
-
-    template = template_config_path(inst)
-    if not template.is_file():
-        config_startup_error(f"template config not found for --inst {inst}: {template}")
-    target = work_dir / f"ds8-{inst}.toml"
-    shutil.copyfile(template, target)
-    terminal_block("config created", (("path", target), ("instrument", inst)))
-    return target, load_config_strict(target)
+    if not candidates:
+        config_startup_error(
+            f"no ds8 TOML in {work_dir}; run `ds8 --inst fxt {path_text or '.'}` "
+            "or `--inst wxt` to create one, then edit it"
+        )
+    path = candidates[0].resolve()
+    return path, load_config_strict(path)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -431,13 +441,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--config",
         default=str(config_path) if config_path is not None else None,
-        help="Path to a TOML config file; when omitted, ds8 uses or creates ds8-<inst>.toml in PATH's directory",
+        help="Path to a TOML config file; when omitted, ds8 uses the single ds8*.toml in PATH's directory",
     )
     parser.add_argument(
         "--inst",
         choices=("fxt", "wxt"),
         default=pre_args.inst or instrument_name,
-        help=f"Instrument profile used to select/create the config file (default: {pre_args.inst or instrument_name})",
+        help="Scaffold only: write a fresh ds8-<inst>.toml template into PATH's directory and exit (does not launch)",
     )
     parser.add_argument(
         "path",
@@ -450,8 +460,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=names.default_detector,
         help=f"Detector id to auto-detect when PATH is a directory (default: {names.default_detector})",
     )
-    parser.add_argument("--src-reg", default="src.reg", help="Source region file (default: src.reg)")
-    parser.add_argument("--bkg-reg", default="bkg.reg", help="Background region file (default: bkg.reg)")
+    parser.add_argument("--src-reg", default=names.inputs.get("src_region", "src.reg"), help="Source region file (default: src.reg, or [inputs].src_region from the config)")
+    parser.add_argument("--bkg-reg", default=names.inputs.get("bkg_region", "bkg.reg"), help="Background region file (default: bkg.reg, or [inputs].bkg_region from the config)")
     parser.add_argument("--output", help="Output PNG used when pressing 's'")
     parser.add_argument("--main-size", type=float, default=400.0, help="Main panel side length in pixels (default: 400)")
     parser.add_argument("--zoom-factor", type=float, default=1.2, help="Initial zoom half-width in source radii (default: 1.2)")
@@ -1929,6 +1939,9 @@ class InteractiveZoom:
         ax,
         inset,
         counts,
+        masked_counts,
+        image,
+        inset_image,
         wcs,
         eventfile: Path,
         project_dir: Path,
@@ -1958,6 +1971,9 @@ class InteractiveZoom:
         self.ax = ax
         self.inset = inset
         self.counts = counts
+        self.masked_counts = masked_counts
+        self.image = image
+        self.inset_image = inset_image
         self.wcs = wcs
         self.eventfile = eventfile
         self.project_dir = project_dir
@@ -2127,6 +2143,7 @@ class InteractiveZoom:
         self.create_handles()
         self.apply_bounds()
         self.update_source_coord_text()
+        self._install_viewport_rendering()
 
         self.cids = [
             fig.canvas.mpl_connect("button_press_event", self.on_press),
@@ -2672,6 +2689,60 @@ class InteractiveZoom:
 
     def event_to_data_xy(self, event) -> tuple[float, float]:
         return tuple(self.ax.transData.inverted().transform((event.x, event.y)))
+
+    def _install_viewport_rendering(self) -> None:
+        # DS9-style rendering: feed each AxesImage only the data inside the current
+        # view (decimated to ~screen resolution when zoomed out), so the per-frame
+        # resample cost scales with the viewport, not the full detector. Re-run on any
+        # limit change -- pan / zoom / scroll / reset all go through set_xlim/set_ylim,
+        # which emit the xlim_changed / ylim_changed callbacks.
+        self._viewport_images = {id(self.ax): self.image, id(self.inset): self.inset_image}
+        self._viewport_state: dict[int, tuple] = {}
+        for target_ax in (self.ax, self.inset):
+            target_ax.callbacks.connect("xlim_changed", self._on_axes_view_changed)
+            target_ax.callbacks.connect("ylim_changed", self._on_axes_view_changed)
+        self.fig.canvas.mpl_connect("resize_event", self._on_canvas_resize)
+        self._render_viewport(self.ax, self.image)
+        self._render_viewport(self.inset, self.inset_image)
+
+    def _on_axes_view_changed(self, ax) -> None:
+        image = self._viewport_images.get(id(ax))
+        if image is not None:
+            self._render_viewport(ax, image)
+
+    def _on_canvas_resize(self, _event) -> None:
+        # The decimation factor is tied to the axes pixel size, so re-evaluate it when
+        # the window (and thus the bbox) changes; clear the cache to defeat the guard.
+        self._viewport_state.clear()
+        self._render_viewport(self.ax, self.image)
+        self._render_viewport(self.inset, self.inset_image)
+
+    def _render_viewport(self, ax, image) -> None:
+        ny, nx = self.masked_counts.shape
+        x0, x1 = sorted(ax.get_xlim())
+        y0, y1 = sorted(ax.get_ylim())
+        margin = 2
+        col0 = max(0, int(math.floor(x0)) - margin)
+        col1 = min(nx, int(math.ceil(x1)) + 1 + margin)
+        row0 = max(0, int(math.floor(y0)) - margin)
+        row1 = min(ny, int(math.ceil(y1)) + 1 + margin)
+        if col1 <= col0 or row1 <= row0:
+            return
+        # Decimate so the sampled array holds at most ~one source pixel per screen
+        # pixel; step == 1 (no decimation) whenever zoomed in near 1:1.
+        screen_w = max(float(ax.bbox.width), 1.0)
+        screen_h = max(float(ax.bbox.height), 1.0)
+        step = max(1, int(min((col1 - col0) / screen_w, (row1 - row0) / screen_h)))
+        key = (col0, col1, row0, row1, step)
+        if self._viewport_state.get(id(ax)) == key:
+            return  # unchanged (e.g. the paired x/y-lim callback) -> skip re-slicing
+        self._viewport_state[id(ax)] = key
+        sub = self.masked_counts[row0:row1:step, col0:col1:step]
+        n_rows, n_cols = sub.shape
+        image.set_data(sub)
+        image.set_extent(
+            (col0 - 0.5, col0 - 0.5 + n_cols * step, row0 - 0.5, row0 - 0.5 + n_rows * step)
+        )
 
     def set_main_window(self, x_center: float, y_center: float, side: float) -> None:
         x_min, x_max = -0.5, self.counts.shape[1] - 0.5
@@ -3473,7 +3544,7 @@ def build_viewer(args: argparse.Namespace):
     inset_rect = [ax_box.x1 - inset_size - inset_margin, ax_box.y1 - inset_size - inset_margin, inset_size, inset_size]
     inset = fig.add_axes(inset_rect, projection=frame.wcs) if frame.wcs is not None else fig.add_axes(inset_rect)
     apply_ds9_axes_style(inset)
-    inset.imshow(masked_counts, origin="lower", cmap=cmap, norm=norm, interpolation="nearest")
+    inset_image = inset.imshow(masked_counts, origin="lower", cmap=cmap, norm=norm, interpolation="nearest")
     src_inset_patches = draw_region(inset, src_circle, "red")
     bkg_inset_patches = draw_region(inset, bkg_circle, "cyan")
     inset.set_aspect("equal")
@@ -3493,6 +3564,9 @@ def build_viewer(args: argparse.Namespace):
         ax=ax,
         inset=inset,
         counts=counts,
+        masked_counts=masked_counts,
+        image=image,
+        inset_image=inset_image,
         wcs=frame.wcs,
         eventfile=eventfile,
         project_dir=project_dir,

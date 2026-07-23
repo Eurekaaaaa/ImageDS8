@@ -23,6 +23,10 @@ mode = "headas"
 [inputs]
 event = "ep*wxt*po_cl.evt"
 mkf = "ep*wxt*.mkf"
+# Region files loaded on startup. If absent, ds8 drops a default circle at the
+# image centre. Overridable per-run with --src-reg / --bkg-reg.
+src_region = "src.reg"
+bkg_region = "bkg.reg"
 rmf = "ep*wxt*.rmf"
 expo = "ep*wxt*.exp"
 arf = "ep*wxt*s{source}.arf"

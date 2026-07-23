@@ -33,6 +33,10 @@ DEFAULT_INPUTS: dict[str, str] = {
     # {detector} expands to "a" or "b" before globbing.
     "event": "fxt_{detector}_*_po_cl_*.fits",
     "mkf": "fxt_*_mkf_*.fits",
+    # Source/background region files loaded on startup; a default circle is placed
+    # at the image centre when the file is absent. Plain filenames (no placeholders).
+    "src_region": "src.reg",
+    "bkg_region": "bkg.reg",
     # Used when [response_files].mode = "existing".
     "rmf": "{stem}.rmf",
     "expo": "{stem}-expo.fits",

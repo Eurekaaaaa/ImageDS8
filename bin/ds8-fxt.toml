@@ -21,6 +21,10 @@ mode = "headas"
 [inputs]
 event = "fxt_{detector}_*_po_cl_*.fits"
 mkf = "fxt_*_mkf_*.fits"
+# Region files loaded on startup. If absent, ds8 drops a default circle at the
+# image centre. Overridable per-run with --src-reg / --bkg-reg.
+src_region = "src.reg"
+bkg_region = "bkg.reg"
 
 [detectors]
 default = "b"
