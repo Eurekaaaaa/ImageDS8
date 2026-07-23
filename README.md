@@ -36,9 +36,41 @@ Either source your desired HEASOFT version in prior to run, or:
 
 ```bash
 export PATH="/path/to/ImageDS8/bin:$PATH"
-# Edit the HEADAS / CALDB paths in set_headas.sh, then:
+# set_headas.sh — edit these two paths to match your install (it then sources the init scripts):
+#   export HEADAS=/path/to/fxtsoftv1.30/fxt/<arch>   # sources $HEADAS/headas-init.sh
+#   export CALDB=/path/to/CALDB                      # sources $CALDB/software/tools/caldbinit.sh
 source /path/to/set_headas.sh        # fxtsoft (HEASOFT) + CALDB
 ```
+
+## Quickstart
+
+Assumes `ds8` is on `PATH` and the Python deps are installed (see [Prerequisites](#prerequisites) and [Install & environment](#install--environment)).
+
+1. **Enter the observation directory.** It must contain both the FXT-A and FXT-B cleaned event files and the MKF file — e.g. `fxt_a_*_po_cl_*.fits`, `fxt_b_*_po_cl_*.fits`, `fxt_*_mkf_*.fits`:
+
+   ```bash
+   cd /path/to/obsdir
+   ```
+
+2. **Scaffold the config** — writes `ds8-fxt.toml` into the directory and exits (does not launch); edit it if the defaults don't fit:
+
+   ```bash
+   ds8 --inst fxt .
+   ```
+
+3. **Set `$HEADAS` and `$CALDB`** — edit the two paths in `set_headas.sh` and source it (see [Install & environment](#install--environment)):
+
+   ```bash
+   source /path/to/set_headas.sh
+   ```
+
+4. **Launch and extract:**
+
+   ```bash
+   ds8 .
+   ```
+
+   In the image window, drag the source and background circles into place, press **`e`** to extract the light curve, then press **`e`** again to extract the spectra.
 
 ## Usage
 

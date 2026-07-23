@@ -35,9 +35,41 @@ ImageDS8 默认 **headas 模式**——直接用 `$HEADAS`、`$CALDB` 以及 PAT
 
 ```bash
 export PATH="/path/to/ImageDS8/bin:$PATH"
-# 编辑 set_headas.sh 里的 HEADAS / CALDB 路径，然后：
+# set_headas.sh —— 改这两处路径为你的安装路径（它会自动 source 对应 init 脚本）：
+#   export HEADAS=/path/to/fxtsoftv1.30/fxt/<arch>   # source $HEADAS/headas-init.sh
+#   export CALDB=/path/to/CALDB                      # source $CALDB/software/tools/caldbinit.sh
 source /path/to/set_headas.sh        # fxtsoft (HEASOFT) + CALDB
 ```
+
+## 快速上手
+
+假设 `ds8` 已在 `PATH` 上、Python 依赖已装好（见[依赖](#依赖)与[安装与环境](#安装与环境)）。
+
+1. **进入观测目录**，目录里须同时有 FXT-A、FXT-B 的 cleaned 事件文件和 MKF 文件，例如 `fxt_a_*_po_cl_*.fits`、`fxt_b_*_po_cl_*.fits`、`fxt_*_mkf_*.fits`：
+
+   ```bash
+   cd /path/to/obsdir
+   ```
+
+2. **生成配置文件**——向目录写入 `ds8-fxt.toml` 后退出（不启动）；默认不合适就编辑它：
+
+   ```bash
+   ds8 --inst fxt .
+   ```
+
+3. **设置 `$HEADAS` 和 `$CALDB`**——改 `set_headas.sh` 里的两处路径并 source（见[安装与环境](#安装与环境)）：
+
+   ```bash
+   source /path/to/set_headas.sh
+   ```
+
+4. **启动并提取：**
+
+   ```bash
+   ds8 .
+   ```
+
+   在图像窗口里拖动源圈、背景圈到位，按 **`e`** 取光变，再按一次 **`e`** 取能谱。
 
 ## 用法
 
