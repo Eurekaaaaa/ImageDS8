@@ -50,8 +50,11 @@ ImageDS8 同时兼容 **Environment Modules**，可将它作为可选的 PATH �
 
 ## 快速上手
 
+### WXT
+
 假设 `ds8` 已在 `PATH` 上、Python 依赖已装好（见[依赖](#依赖)与
-[安装与环境](#安装与环境)）。以下示例采用标准 HEADAS 工作流：在生成的 TOML 中设置
+[安装与环境](#安装与环境)）。本示例采用标准 HEADAS 工作流：在生成的
+`ds8-wxt.toml` 中设置
 
 ```toml
 [heasoft]
@@ -61,8 +64,6 @@ mode = "headas"
 并在启动 `ds8` 前初始化 HEASOFT/fxtsoft 与 CALDB。若使用 Environment Modules
 管理这些工具，则保留 `mode = "module"`，配置 `module` 与 `modules_init`，并另行
 初始化 CALDB。
-
-### WXT
 
 1. **进入 WXT 观测目录。** 目录中应包含 cleaned 事件文件，以及所选源对应的已有
    RMF/ARF。默认匹配模式为 `ep*wxt*po_cl.evt`、`ep*wxt*.rmf` 和
@@ -89,6 +90,19 @@ mode = "headas"
    WXT 响应文件提取能谱，按 **`x`** 打开 XSPEC。
 
 ### FXT
+
+假设 `ds8` 已在 `PATH` 上、Python 依赖已装好（见[依赖](#依赖)与
+[安装与环境](#安装与环境)）。本示例采用标准 HEADAS 工作流：在生成的
+`ds8-fxt.toml` 中设置
+
+```toml
+[heasoft]
+mode = "headas"
+```
+
+并在启动 `ds8` 前初始化 HEASOFT/fxtsoft 与 CALDB。若使用 Environment Modules
+管理这些工具，则保留 `mode = "module"`，配置 `module` 与 `modules_init`，并另行
+初始化 CALDB。
 
 1. **进入 FXT 观测目录。** 目录中须包含 FXT-A 和/或 FXT-B 的 cleaned 事件文件，
    以及对应的 MKF 文件，例如 `fxt_a_*_po_cl_*.fits`、`fxt_b_*_po_cl_*.fits` 和

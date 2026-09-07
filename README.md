@@ -54,9 +54,11 @@ launching shell.
 
 ## Quickstart
 
+### WXT
+
 Assumes `ds8` is on `PATH` and the Python dependencies are installed (see
 [Prerequisites](#prerequisites) and [Install & environment](#install--environment)).
-The examples below use the standard HEADAS workflow: set the generated TOML to
+This example uses the standard HEADAS workflow: set the generated `ds8-wxt.toml` to
 
 ```toml
 [heasoft]
@@ -66,8 +68,6 @@ mode = "headas"
 and initialize HEASOFT/fxtsoft and CALDB before launching `ds8`. If your system
 uses Environment Modules to manage these tools, keep `mode = "module"`, configure
 `module` and `modules_init`, and initialize CALDB separately.
-
-### WXT
 
 1. **Enter the WXT observation directory.** It should contain the cleaned event
    file and the existing RMF/ARF for the selected source. The default patterns are
@@ -96,6 +96,19 @@ uses Environment Modules to manage these tools, keep `mode = "module"`, configur
    using the existing WXT responses, and press **`x`** to open XSPEC.
 
 ### FXT
+
+Assumes `ds8` is on `PATH` and the Python dependencies are installed (see
+[Prerequisites](#prerequisites) and [Install & environment](#install--environment)).
+This example uses the standard HEADAS workflow: set the generated `ds8-fxt.toml` to
+
+```toml
+[heasoft]
+mode = "headas"
+```
+
+and initialize HEASOFT/fxtsoft and CALDB before launching `ds8`. If your system
+uses Environment Modules to manage these tools, keep `mode = "module"`, configure
+`module` and `modules_init`, and initialize CALDB separately.
 
 1. **Enter the FXT observation directory.** It must contain an FXT-A and/or FXT-B
    cleaned event file and the matching MKF file, for example
