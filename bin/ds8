@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import atexit
 import argparse
+import csv
+import datetime
 import math
 import os
 from pathlib import Path
@@ -14,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+from typing import NamedTuple
 
 os.environ["DS8_FRAME_PLOT_INTERACTIVE"] = "1"
 
@@ -36,23 +39,35 @@ if str(HELPER_DIR) not in sys.path:
 import matplotlib.pyplot as plt
 import numpy as np
 import astropy.units as u
+from astropy.coordinates import SkyCoord
 from astropy.io import fits
+from astropy.time import Time
 from matplotlib.lines import Line2D
+from matplotlib.colors import is_color_like
 from matplotlib.patches import Circle, Rectangle
 from matplotlib.text import Text
+from matplotlib.ticker import Formatter, Locator
 from matplotlib.widgets import SpanSelector
 
 from ds8_frame_plot import (
+    AnnulusRegion,
+    CircleRegion,
     PixelAnnulus,
     PixelCircle,
     add_main_axes_frame,
+    angular_radius_to_pixels,
     apply_ds9_axes_style,
     configure_wcs_axes,
     display_limits_for,
+    draw_reference_region,
     draw_region,
     load_frame,
     log_norm_for,
+    parse_angle_degrees,
     parse_region_file,
+    parse_region_file_all,
+    parse_sky_coord,
+    pixel_radius_to_angular,
     region_to_pixel,
     region_to_pixel_circle,
     resolve_cmap,
@@ -83,10 +98,10 @@ _BAR_ACTIVE = False
 _BAR_EXIT_REGISTERED = False
 _BAR_SUSPENDED = False
 _COMPACT_HINTS = {
-    "e=LC/spec  x=XSPEC  c=centroid  b=auto-bkg  tab=type  z=zoom  s=save  r=reset  q=quit":
-        "e LC/spec  x XSPEC  c ctr  b bkg  tab type  z zoom  s save  r reset  q quit",
-    "=/- 1s  ctrl+/- 10s  cmd+/- 100s  |  g=GTI  drag=select  enter=extract  u=undo  esc=clear":
-        "+/-1s  ctrl10s  cmd100s  g GTI  drag select  enter extract  u undo  esc clear",
+    "e=LC/spec  x=XSPEC  c=centroid  b=auto-bkg  tab=type  z=zoom  r=reference  R=reset  s=save  q=quit":
+        "e LC/spec x XSPEC c ctr b bkg tab type z zoom r ref R reset s save q quit",
+    "=/- 1s  ctrl+/- 10s  cmd+/- 100s  |  g=GTI  drag=select  enter=extract  x=XSPEC(first)  u=undo  esc=clear":
+        "+/-1s ctrl10s cmd100s g GTI drag select enter extract x XSPEC1 u undo esc clear",
 }
 
 
@@ -254,12 +269,16 @@ def terminal_error(message: str, rows: list[tuple[str, object]] | tuple[tuple[st
 # available. Resolved once from the config/CLI in main() and read by the two exec
 # sites. Kept as a module-level setting because it is fixed for the whole run and
 # must be re-derived identically in the forked light-curve subprocess.
-#   "headas": use the environment's $HEADAS (default). Errors if $HEADAS is unset.
-#   "module": load HEASOFT through Environment Modules instead.
-HEASOFT_MODE = "headas"
+#   "module": load HEASOFT through Environment Modules (default).
+#   "headas": use the environment's $HEADAS. Errors if $HEADAS is unset.
+HEASOFT_MODE = "module"
 
-DEFAULT_HEASOFT_MODULE = "heasoft/fxt1.20.1d"
+DEFAULT_HEASOFT_MODULE = "heasoft/fxt1.30"
 DEFAULT_MODULES_INIT = "/opt/homebrew/opt/modules/init/profile.sh"
+DEFAULT_REFERENCE_COLOR = "#DA70D6"
+DEFAULT_EPSC_COLOR = "#7CFC00"
+DEFAULT_EPSC_LOW_SNR_COLOR = "#808080"
+DEFAULT_EPSC_SNR_THRESHOLD = 7.0
 INSTRUMENT_NAME = "fxt"
 RESPONSE_FILES_MODE = "generate"
 ENERGY_FILTER = True
@@ -334,6 +353,242 @@ def spatial_bin_from_config(config: dict, instrument_name: str) -> int:
 def drag_region_body_from_config(config: dict, instrument_name: str) -> bool:
     default = instrument_name == "wxt"
     return cfg_bool(cfg_table(config, "viewer"), "drag_region_body", default)
+
+
+def _reference_value_text(value: object, key: str) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError(f"[reference_region].{key} must be a string or number")
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"[reference_region].{key} must not be empty")
+    return text
+
+
+def configured_overlay_color(config: dict, table_name: str, default: str) -> str:
+    raw = config.get(table_name)
+    if raw is None:
+        return default
+    if not isinstance(raw, dict):
+        raise ValueError(f"[{table_name}] must be a TOML table")
+    value = raw.get("color", default)
+    if not isinstance(value, str) or not value.strip() or not is_color_like(value.strip()):
+        raise ValueError(f"[{table_name}].color is not a valid Matplotlib color: {value!r}")
+    return value.strip()
+
+
+def reference_regions_from_config(config: dict, project_dir: Path) -> tuple[tuple, Path | None]:
+    """Load static FK5 reference overlays from the TOML configuration.
+
+    ``[reference_region]`` accepts either ``ra``/``dec``/``radius`` or a DS9
+    ``file`` (``path`` is accepted as an alias). Relative files are resolved from
+    the observation/project directory, matching the other configured inputs.
+    """
+    raw = config.get("reference_region")
+    if raw is None:
+        return (), None
+    if not isinstance(raw, dict):
+        raise ValueError("[reference_region] must be a TOML table")
+    if not raw:
+        return (), None
+
+    label_value = raw.get("label", "reference")
+    if not isinstance(label_value, str) or not label_value.strip():
+        raise ValueError("[reference_region].label must be a non-empty string")
+    label = label_value.strip()
+
+    file_value = raw.get("file")
+    path_value = raw.get("path")
+    if file_value is not None and path_value is not None:
+        raise ValueError("[reference_region] accepts only one of 'file' or 'path'")
+    configured_file = file_value if file_value is not None else path_value
+    geometry_keys = ("ra", "dec", "radius")
+    present_geometry = [key for key in geometry_keys if key in raw]
+
+    source_path: Path | None = None
+    if configured_file is not None:
+        if present_geometry:
+            raise ValueError(
+                "[reference_region] must use either file/path or ra/dec/radius, not both"
+            )
+        if not isinstance(configured_file, str) or not configured_file.strip():
+            raise ValueError("[reference_region].file must be a non-empty path string")
+        source_path = resolve_region(configured_file, project_dir)
+        regions = parse_region_file_all(source_path, label)
+    else:
+        if not present_geometry:
+            raise ValueError(
+                "[reference_region] must define either file/path or ra, dec, and radius"
+            )
+        missing = [key for key in geometry_keys if key not in raw]
+        if missing:
+            raise ValueError(
+                "[reference_region] inline geometry is incomplete; missing: "
+                + ", ".join(missing)
+            )
+        regions = (
+            CircleRegion(
+                label=label,
+                system="fk5",
+                x_text=_reference_value_text(raw["ra"], "ra"),
+                y_text=_reference_value_text(raw["dec"], "dec"),
+                radius_text=_reference_value_text(raw["radius"], "radius"),
+            ),
+        )
+
+    for region in regions:
+        if region.system != "fk5":
+            location = source_path if source_path is not None else "[reference_region]"
+            raise ValueError(f"Reference regions must use FK5 coordinates: {location}")
+        # Validate coordinates and positive radii before constructing the viewer so a
+        # malformed TOML/DS9 file produces one clear startup error.
+        parse_sky_coord(region)
+        radius_texts = (
+            (region.inner_radius_text, region.outer_radius_text)
+            if isinstance(region, AnnulusRegion)
+            else (region.radius_text,)
+        )
+        radii = tuple(parse_angle_degrees(text) for text in radius_texts)
+        if any(radius <= 0 for radius in radii):
+            raise ValueError("Reference-region radius must be greater than zero")
+        if len(radii) == 2 and radii[0] >= radii[1]:
+            raise ValueError("Reference-region annulus requires inner radius < outer radius")
+    return tuple(regions), source_path
+
+
+class EpscSource(NamedTuple):
+    number: int
+    name: str
+    snr: float
+    center: SkyCoord
+
+
+class PixelEpscSource(NamedTuple):
+    number: int
+    name: str
+    snr: float
+    x: float
+    y: float
+
+
+def load_epsc_csv(path: Path) -> tuple[EpscSource, ...]:
+    """Load EPSC pipeline detections in file order from the RA/Dec CSV columns."""
+    if not path.is_file():
+        raise FileNotFoundError(f"EPSC source CSV not found: {path}")
+    try:
+        handle = path.open("r", encoding="utf-8-sig", newline="")
+    except OSError as exc:
+        raise ValueError(f"Could not read EPSC source CSV {path}: {exc}") from exc
+
+    with handle:
+        reader = csv.DictReader(handle)
+        fieldnames = set(reader.fieldnames or ())
+        missing_columns = [name for name in ("RA", "Dec", "SNR") if name not in fieldnames]
+        if missing_columns:
+            raise ValueError(
+                f"EPSC source CSV {path} is missing column(s): {', '.join(missing_columns)}"
+            )
+        sources: list[EpscSource] = []
+        for number, row in enumerate(reader, 1):
+            try:
+                ra = float((row.get("RA") or "").strip())
+                dec = float((row.get("Dec") or "").strip())
+                snr = float((row.get("SNR") or "").strip())
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid RA/Dec/SNR in EPSC source CSV {path} at data row {number}"
+                ) from exc
+            if not math.isfinite(ra) or not math.isfinite(dec) or not math.isfinite(snr):
+                raise ValueError(
+                    f"Non-finite RA/Dec/SNR in EPSC source CSV {path} at data row {number}"
+                )
+            if not 0.0 <= ra < 360.0 or not -90.0 <= dec <= 90.0:
+                raise ValueError(
+                    f"RA/Dec out of range in EPSC source CSV {path} at data row {number}"
+                )
+            name = str(row.get("Name") or "").strip()
+            sources.append(
+                EpscSource(
+                    number=number,
+                    name=name,
+                    snr=snr,
+                    center=SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="fk5"),
+                )
+            )
+    return tuple(sources)
+
+
+def resolve_epsc_csv(path_text: str, event_dir: Path) -> Path:
+    """Resolve an EPSC catalog, preferring a valid configured path.
+
+    Relative paths are anchored beside the event files.  For compatibility with
+    copied observation configs that still contain a stale absolute directory,
+    also look for the configured CSV filename beside the event files.
+    """
+    configured = Path(path_text).expanduser()
+    if not configured.is_absolute():
+        return (event_dir / configured).resolve()
+
+    configured = configured.resolve()
+    if configured.is_file():
+        return configured
+
+    colocated = (event_dir / configured.name).resolve()
+    if colocated.is_file():
+        return colocated
+    return configured
+
+
+def epsc_sources_from_config(
+    config: dict,
+    project_dir: Path,
+    displayed_detectors: tuple[str, ...],
+) -> tuple[dict[str, tuple[EpscSource, ...]], dict[str, Path]]:
+    """Load the detector-specific EPSC CSV configured for each displayed FXT panel."""
+    raw = config.get("epsc_sources")
+    if raw is None or raw == {}:
+        return {}, {}
+    if not isinstance(raw, dict):
+        raise ValueError("[epsc_sources] must be a TOML table")
+    if instrument_name_from_config(config) != "fxt":
+        raise ValueError("[epsc_sources] is only supported for the FXT instrument")
+
+    configured_detector_keys = [
+        key for key in raw if key not in {"color", "snr_threshold"}
+    ]
+    if not configured_detector_keys:
+        raise ValueError("[epsc_sources] must declare detector CSV paths, for example a and b")
+
+    paths_by_detector: dict[str, Path] = {}
+    for detector in displayed_detectors:
+        value = raw.get(detector)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"[epsc_sources].{detector} must declare the CSV for displayed detector "
+                f"{NAMES.detector_label(detector)}"
+            )
+        paths_by_detector[detector] = resolve_epsc_csv(value, project_dir)
+
+    # Validate the complete detector mapping before opening files, so a missing A/B
+    # declaration is reported directly instead of being masked by an earlier I/O error.
+    sources_by_detector: dict[str, tuple[EpscSource, ...]] = {}
+    for detector, path in paths_by_detector.items():
+        sources_by_detector[detector] = load_epsc_csv(path)
+    return sources_by_detector, paths_by_detector
+
+
+def epsc_snr_threshold_from_config(config: dict) -> float:
+    raw = config.get("epsc_sources")
+    if raw is None or raw == {}:
+        return DEFAULT_EPSC_SNR_THRESHOLD
+    if not isinstance(raw, dict):
+        raise ValueError("[epsc_sources] must be a TOML table")
+    value = raw.get("snr_threshold", DEFAULT_EPSC_SNR_THRESHOLD)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("[epsc_sources].snr_threshold must be a finite number")
+    threshold = float(value)
+    if not math.isfinite(threshold):
+        raise ValueError("[epsc_sources].snr_threshold must be a finite number")
+    return threshold
 
 
 def config_startup_error(message: str) -> None:
@@ -457,8 +712,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--detector",
-        default=names.default_detector,
-        help=f"Detector id to auto-detect when PATH is a directory (default: {names.default_detector})",
+        default=None,
+        help="Detector id to force the single-detector view (e.g. a or b). Default: auto -- open the parallel A/B view when both event files are present, else the single match.",
     )
     parser.add_argument("--src-reg", default=names.inputs.get("src_region", "src.reg"), help="Source region file (default: src.reg, or [inputs].src_region from the config)")
     parser.add_argument("--bkg-reg", default=names.inputs.get("bkg_region", "bkg.reg"), help="Background region file (default: bkg.reg, or [inputs].bkg_region from the config)")
@@ -482,8 +737,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--heasoft-mode",
         choices=("headas", "module"),
-        default=cfg_default("DS8_HEASOFT_MODE", "mode", "headas"),
-        help="How to reach HEASOFT/fxtsoft tools: 'headas' uses the environment's $HEADAS (default), 'module' loads via Environment Modules",
+        default=cfg_default("DS8_HEASOFT_MODE", "mode", "module"),
+        help="How to reach HEASOFT/fxtsoft tools: 'module' loads via Environment Modules (default), 'headas' uses the environment's $HEADAS",
     )
     parser.add_argument(
         "--module",
@@ -501,6 +756,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lc-eventfile", help=argparse.SUPPRESS)
     parser.add_argument("--lc-project-dir", help=argparse.SUPPRESS)
     parser.add_argument("--lc-mkf", help=argparse.SUPPRESS)
+    # Second detector (B) for the parallel light-curve window.
+    parser.add_argument("--dual-lc", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--plot-lc-b", help=argparse.SUPPRESS)
+    parser.add_argument("--plot-title-b", default="Corrected light curve", help=argparse.SUPPRESS)
+    parser.add_argument("--watch-lc-b", help=argparse.SUPPRESS)
+    parser.add_argument("--lc-eventfile-b", help=argparse.SUPPRESS)
+    parser.add_argument("--lc-project-dir-b", help=argparse.SUPPRESS)
+    parser.add_argument("--lc-mkf-b", help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true", help="Print selected files and initial limits without opening a window")
     args = parser.parse_args(argv)
     args._config = config  # full config tables, used to build IONames in main()
@@ -634,6 +897,45 @@ def clamp_center(x: float, y: float, radius: float, counts) -> tuple[float, floa
     return (
         min(max(x, -0.5 + radius), counts.shape[1] - 0.5 - radius),
         min(max(y, -0.5 + radius), counts.shape[0] - 0.5 - radius),
+    )
+
+
+def offset_generated_background(source_region, background_region, counts) -> PixelCircle:
+    """Place an autogenerated background circle away from the source circle."""
+    clearance = max(float(source_region.radius), float(background_region.radius), 2.0)
+    distance = float(source_region.radius) + float(background_region.radius) + clearance
+    diagonal = 1.0 / math.sqrt(2.0)
+    directions = (
+        (1.0, 0.0),
+        (-1.0, 0.0),
+        (0.0, 1.0),
+        (0.0, -1.0),
+        (diagonal, diagonal),
+        (-diagonal, diagonal),
+        (diagonal, -diagonal),
+        (-diagonal, -diagonal),
+    )
+    candidates = [
+        clamp_center(
+            source_region.x + dx * distance,
+            source_region.y + dy * distance,
+            background_region.radius,
+            counts,
+        )
+        for dx, dy in directions
+    ]
+    bx, by = max(
+        candidates,
+        key=lambda center: math.hypot(
+            center[0] - source_region.x,
+            center[1] - source_region.y,
+        ),
+    )
+    return PixelCircle(
+        background_region.label,
+        bx,
+        by,
+        background_region.radius,
     )
 
 
@@ -827,7 +1129,7 @@ def run_heasoft_command(
             env=env,
         )
 
-    # headas mode (default): rely on the environment's $HEADAS-initialised HEASOFT.
+    # headas mode: rely on the environment's $HEADAS-initialised HEASOFT.
     if not env.get("HEADAS"):
         raise RuntimeError(
             "$HEADAS is not set. Source your fxtsoft headas-init.sh first (so $HEADAS points to fxtsoft "
@@ -857,6 +1159,128 @@ def require_success(result: subprocess.CompletedProcess[str], label: str) -> Non
     output = "\n".join(part for part in (result.stdout, result.stderr) if part)
     tail = "\n".join(output.splitlines()[-30:])
     raise RuntimeError(f"{label} failed with return code {result.returncode}.\n{tail}")
+
+
+def run_grppha(
+    src_pha: Path,
+    min_counts: int,
+    module_name: str,
+    modules_init: str,
+) -> Path:
+    """Create the grouped source PHA used by both full and GTI spectra."""
+    out = src_pha.with_name(f"{src_pha.stem}-g{min_counts}{src_pha.suffix}")
+    result = run_heasoft_command(
+        ["grppha", str(src_pha), f"!{out}", f"comm=group min {min_counts} & exit", "chatter=5"],
+        cwd=src_pha.parent,
+        stdin_text="",
+        module_name=module_name,
+        modules_init=modules_init,
+    )
+    require_success(result, "grppha")
+    if not out.is_file():
+        raise RuntimeError(f"grppha completed but output not found: {out}")
+    return out
+
+
+def assemble_spectrum_products_for_xspec(
+    workdir: Path,
+    products_by_detector: dict[str, dict[str, Path]],
+) -> Path:
+    """Copy multi-detector products to their standard names in one XSPEC directory."""
+    workdir = prepare_overwrite_dir(workdir)
+    for detector, products in products_by_detector.items():
+        destinations = NAMES.spectrum_products_for_detector(
+            workdir,
+            detector,
+            source=SOURCE_ID,
+        )
+        for key in ("src_pha", "bkg_pha", "rmf", "arf", "expo"):
+            src = products.get(key)
+            destination = destinations.get(key)
+            if src is not None and destination is not None and Path(src).is_file():
+                shutil.copyfile(src, destination)
+    return workdir
+
+
+def xspec_command_for_products(
+    products_by_detector: dict[str, dict[str, Path]],
+    *,
+    dual_workdir: Path,
+) -> tuple[list[str], Path]:
+    """Build the same XSPEC invocation for full-observation or GTI products."""
+    helper = Path(__file__).resolve().with_name("xspec_init")
+    command = [str(helper) if helper.is_file() else "xspec_init"]
+    if len(products_by_detector) > 1:
+        workdir = assemble_spectrum_products_for_xspec(dual_workdir, products_by_detector)
+        command.extend([str(workdir), "-r", "3"])
+    else:
+        products = next(iter(products_by_detector.values()))
+        workdir = Path(products["workdir"])
+        command.extend(
+            [
+                str(workdir),
+                "--data",
+                str(products["src_pha"]),
+                "--background",
+                str(products["bkg_pha"]),
+                "--rmf",
+                str(products["rmf"]),
+                "--arf",
+                str(products["arf"]),
+                "-r",
+                "3",
+            ]
+        )
+    if SOURCE_ID is not None:
+        command.extend(["--source", str(SOURCE_ID)])
+    if CONFIG_PATH:
+        command.extend(["--config", CONFIG_PATH])
+    return command, workdir
+
+
+def launch_xspec_command(
+    command: list[str],
+    *,
+    workdir: Path,
+    module_name: str,
+    modules_init: str,
+) -> subprocess.Popen:
+    """Launch xspec_init in the configured HEASOFT environment."""
+    shell_parts: list[str] = []
+    if HEASOFT_MODE == "module":
+        init = Path(modules_init).expanduser()
+        if not init.is_file():
+            raise RuntimeError(f"--heasoft-mode=module but the Environment Modules init file was not found: {init}")
+        shell_parts.extend(
+            [
+                f". {shlex.quote(str(init))}",
+                f"module load {shlex.quote(module_name)}",
+            ]
+        )
+    elif not os.environ.get("HEADAS"):
+        raise RuntimeError(
+            "$HEADAS is not set; cannot launch XSPEC in headas mode. Source your fxtsoft "
+            "headas-init.sh, or set mode=module."
+        )
+    shell_parts.append(f"exec {shlex.join(command)}")
+    suspend_terminal_hints()
+    try:
+        process = subprocess.Popen(
+            ["bash", "-lc", "; ".join(shell_parts)],
+            cwd=workdir,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except Exception:
+        resume_terminal_hints()
+        raise
+
+    def resume_after_xspec() -> None:
+        process.wait()
+        resume_terminal_hints()
+
+    threading.Thread(target=resume_after_xspec, daemon=True).start()
+    return process
 
 
 def time_column_unit(header: fits.Header, names) -> str:
@@ -943,6 +1367,101 @@ def lightcurve_time_base_seconds(path: Path) -> tuple[float, fits.Header]:
             if result is not None:
                 return result
     raise RuntimeError(f"No usable time reference found in {path}")
+
+
+# EP mission time is TT seconds since MJDREF = MJDREFI + MJDREFF
+# (58849 + 0.00080074074, the TT MJD of 2020-01-01T00:00:00 UTC), so UTC comes from
+# MJDREF plus TIMESYS. DATE-OBS is deliberately not used as the reference: the WXT
+# pipeline writes it by adding MJDREF as if it were already UTC, putting it 69.184 s
+# (= TT - UTC) later than the true UTC, while FXT writes it correctly. Going through
+# MJDREF keeps both instruments on one convention.
+UTC_TICK_STEPS = (1, 2, 5, 10, 15, 20, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 21600, 43200, 86400)
+
+
+def utc_datetime(timestamp: float) -> datetime.datetime:
+    return datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc)
+
+
+def utc_tick_step(span_seconds: float, max_ticks: int = 6) -> float:
+    """Smallest round clock interval that keeps the tick count at or under ``max_ticks``."""
+    for step in UTC_TICK_STEPS:
+        if span_seconds / step <= max_ticks:
+            return float(step)
+    return float(UTC_TICK_STEPS[-1])
+
+
+def lightcurve_utc_epoch(path: Path) -> float | None:
+    """POSIX timestamp of the first plotted bin, i.e. of x=0 on the light curve.
+
+    Returns None when the file carries no usable time reference, so the UTC axis is
+    skipped instead of breaking the panel."""
+    try:
+        base_seconds, header = lightcurve_time_base_seconds(path)
+    except (RuntimeError, OSError):
+        return None
+    if "MJDREFI" in header:
+        mjdref = float(header["MJDREFI"]) + float(header.get("MJDREFF", 0.0))
+    elif "MJDREF" in header:
+        mjdref = float(header["MJDREF"])
+    else:
+        return None
+    timesys = str(header.get("TIMESYS", "TT")).strip().lower()
+    if timesys not in {"tt", "tai", "utc", "tdb", "tcb", "tcg"}:
+        return None
+    try:
+        return float(Time(mjdref, base_seconds / 86400.0, format="mjd", scale=timesys).utc.unix)
+    except (ValueError, TypeError):
+        return None
+
+
+class UTCTickLocator(Locator):
+    """Ticks on round UTC clock boundaries, placed in seconds-since-start coordinates."""
+
+    def __init__(self, epoch_unix: float, max_ticks: int = 6) -> None:
+        self.epoch_unix = epoch_unix
+        self.max_ticks = max_ticks
+
+    def __call__(self):
+        low, high = sorted(self.axis.get_view_interval())
+        step = utc_tick_step(high - low, self.max_ticks)
+        first = math.ceil((self.epoch_unix + low) / step) * step
+        count = int(math.floor((self.epoch_unix + high - first) / step)) + 1
+        if count <= 0:
+            return []
+        return self.raise_if_exceeds(first + step * np.arange(count) - self.epoch_unix)
+
+
+class UTCTickFormatter(Formatter):
+    """Renders a seconds-since-start position as its UTC clock time."""
+
+    def __init__(self, epoch_unix: float, max_ticks: int = 6) -> None:
+        self.epoch_unix = epoch_unix
+        self.max_ticks = max_ticks
+
+    def __call__(self, x, pos=None) -> str:
+        low, high = sorted(self.axis.get_view_interval())
+        seconds_resolved = utc_tick_step(high - low, self.max_ticks) < 60
+        return utc_datetime(self.epoch_unix + x).strftime("%H:%M:%S" if seconds_resolved else "%H:%M")
+
+
+def add_utc_axis(ax, path: Path, time_values: np.ndarray) -> bool:
+    """Mirror the elapsed-time axis with UTC along the top. False when unavailable."""
+    epoch_unix = lightcurve_utc_epoch(path)
+    if epoch_unix is None:
+        return False
+    secondary = ax.secondary_xaxis("top")
+    secondary.xaxis.set_major_locator(UTCTickLocator(epoch_unix))
+    secondary.xaxis.set_major_formatter(UTCTickFormatter(epoch_unix))
+    span = float(time_values.max() - time_values.min()) if time_values.size else 0.0
+    first_day = utc_datetime(epoch_unix).date()
+    last_day = utc_datetime(epoch_unix + span).date()
+    day_label = f"{first_day}" if first_day == last_day else f"{first_day} to {last_day}"
+    secondary.set_xlabel(f"UTC ({day_label})")
+    secondary.tick_params(colors="white")
+    secondary.xaxis.label.set_color("white")
+    for spine in secondary.spines.values():
+        spine.set_color("white")
+    return True
 
 
 def write_interval_gti(path: Path, start: float, stop: float, template_header: fits.Header) -> None:
@@ -1120,7 +1639,8 @@ def draw_lightcurve_on_axes(ax, path: Path, title: str, lc_bin: float | None = N
         ax.plot(time_values, rate_values, "o-", ms=3, lw=1, color="cyan")
     ax.set_xlabel(f"Time since start ({unit})")
     ax.set_ylabel("Rate")
-    ax.set_title(title)
+    has_utc_axis = add_utc_axis(ax, path, time_values)
+    ax.set_title(title, pad=36 if has_utc_axis else 6)
     ax.text(
         0.985,
         0.965,
@@ -1136,20 +1656,19 @@ def draw_lightcurve_on_axes(ax, path: Path, title: str, lc_bin: float | None = N
 
 def install_lightcurve_rebin_controls(
     fig,
-    ax,
-    initial_path: Path,
-    title: str,
+    tracks: list[dict],
     lc_bin: float,
     module_name: str,
     modules_init: str,
-    eventfile: Path | None = None,
-    project_dir: Path | None = None,
-    mkf_file: Path | None = None,
     psfcor: float = 1.0,
 ) -> dict:
+    """Wire rebin (=/-) and GTI controls for one or more light-curve tracks that
+    share one figure. Each ``track`` is a dict with an ``ax`` and its own
+    ``source_path``/``display_path``/``title`` plus (optional) ``eventfile``,
+    ``project_dir``, ``mkf`` and ``detector`` for GTI interval extraction."""
+    for track in tracks:
+        track.setdefault("display_path", track["source_path"])
     state = {
-        "source_path": initial_path,
-        "display_path": initial_path,
         "bin": max(1.0, float(lc_bin)),
         "custom_bin": False,
         "last_error": None,
@@ -1158,58 +1677,75 @@ def install_lightcurve_rebin_controls(
         "extracting": False,
         "held_modifiers": {},
         "debug_keys": os.environ.get("DS8_DEBUG_KEYS", "").lower() in {"1", "true", "yes", "on"},
+        "tracks": tracks,
+        "first_gti_products": None,
+        "first_gti_xspec_dir": None,
+        "xspec_processes": [],
     }
+    top_ax = tracks[0]["ax"]
+    dual = len(tracks) > 1
+    has_event_context = all(t.get("eventfile") is not None and t.get("project_dir") is not None for t in tracks)
 
     def draw_interval_overlays() -> None:
-        for start, stop in state["intervals"]:
-            ax.axvspan(start, stop, color="yellow", alpha=0.24, lw=0)
+        for track in tracks:
+            for start, stop in state["intervals"]:
+                track["ax"].axvspan(start, stop, color="yellow", alpha=0.24, lw=0)
         if state["interval_mode"]:
             text = "GTI: drag intervals | Enter extract | u undo | Esc cancel"
         elif state["intervals"]:
             text = f"GTI intervals: {len(state['intervals'])} | Enter extract"
         else:
             text = "GTI: click button to select intervals"
-        ax.text(
-            0.015,
-            0.965,
-            text,
-            transform=ax.transAxes,
-            color="white",
-            fontsize=8,
-            ha="left",
-            va="top",
-            alpha=0.85,
+        top_ax.text(
+            0.015, 0.965, text, transform=top_ax.transAxes, color="white",
+            fontsize=8, ha="left", va="top", alpha=0.85,
         )
 
-    def redraw(path: Path) -> None:
-        draw_lightcurve_on_axes(ax, path, title, state["bin"])
+    def redraw() -> None:
+        for track in tracks:
+            draw_lightcurve_on_axes(track["ax"], track["display_path"], track["title"], state["bin"])
         draw_interval_overlays()
-        fig.subplots_adjust(left=0.10, right=0.98, bottom=0.15, top=0.88)
-        state["display_path"] = path
+        if dual:
+            fig.subplots_adjust(left=0.10, right=0.98, bottom=0.09, top=0.89, hspace=0.55)
+        else:
+            fig.subplots_adjust(left=0.10, right=0.98, bottom=0.15, top=0.82)
         state["last_error"] = None
         fig.canvas.draw_idle()
 
-    def display_source(path: Path) -> None:
-        state["source_path"] = path
-        state["source_mtime"] = path_mtime_ns(path)
+    def refresh_track_display(track) -> None:
+        if state["custom_bin"]:
+            track["display_path"] = rebin_lightcurve_for_display(track["source_path"], state["bin"], module_name, modules_init)
+        else:
+            track["display_path"] = track["source_path"]
+
+    def _report_rebin_error(exc: Exception) -> None:
+        message = str(exc)
+        if message != state["last_error"]:
+            terminal_warning("could not rebin LC", (("bin", format_lc_bin(state["bin"])), ("detail", message)))
+            state["last_error"] = message
+
+    def display_all() -> None:
         try:
-            display_path = (
-                rebin_lightcurve_for_display(path, state["bin"], module_name, modules_init)
-                if state["custom_bin"]
-                else path
-            )
-            redraw(display_path)
+            for track in tracks:
+                refresh_track_display(track)
+            redraw()
         except Exception as exc:
-            message = str(exc)
-            if message != state["last_error"]:
-                terminal_warning("could not rebin LC", (("bin", format_lc_bin(state["bin"])), ("detail", message)))
-                state["last_error"] = message
+            _report_rebin_error(exc)
+
+    def set_track_source(track, path: Path) -> None:
+        track["source_path"] = path
+        track["source_mtime"] = path_mtime_ns(path)
+        try:
+            refresh_track_display(track)
+            redraw()
+        except Exception as exc:
+            _report_rebin_error(exc)
 
     def set_interval_mode(active: bool) -> None:
         state["interval_mode"] = active
         span_selector.set_active(active)
         gti_button.set_text("GTI*" if active else "GTI")
-        redraw(state["display_path"])
+        redraw()
 
     def on_select_interval(x_min: float, x_max: float) -> None:
         if not state["interval_mode"]:
@@ -1218,11 +1754,11 @@ def install_lightcurve_rebin_controls(
         if stop - start <= 0:
             return
         state["intervals"].append((start, stop))
-        redraw(state["display_path"])
+        redraw()
 
     try:
         span_selector = SpanSelector(
-            ax,
+            top_ax,
             on_select_interval,
             "horizontal",
             useblit=True,
@@ -1231,7 +1767,7 @@ def install_lightcurve_rebin_controls(
         )
     except TypeError:
         span_selector = SpanSelector(
-            ax,
+            top_ax,
             on_select_interval,
             "horizontal",
             useblit=True,
@@ -1240,27 +1776,72 @@ def install_lightcurve_rebin_controls(
     span_selector.set_active(False)
 
     def on_gti_button(event) -> None:  # noqa: ARG001
-        if eventfile is None or project_dir is None:
+        if not has_event_context:
             terminal_warning("GTI spectrum selection is unavailable; missing event context")
             return
         set_interval_mode(not state["interval_mode"])
 
     # GTI toggle built from the same OverlayButton entity as the main window's deg/hms
     # button (transAxes -> pinned to this axes; figure-level -> survives ax.clear()).
-    gti_button = OverlayButton(ax, (0.85, 1.008), (0.11, 0.07), "GTI", on_gti_button, fontsize=12)
+    gti_button = OverlayButton(top_ax, (0.85, 1.008), (0.11, 0.07), "GTI", on_gti_button, fontsize=12)
 
-    def extraction_context() -> tuple[Path, Path, Path | None, Path, Path]:
-        if eventfile is None or project_dir is None:
-            raise RuntimeError("missing event context")
-        workdir = state["source_path"].parent
-        src_reg = workdir / WORK_SRC_REGION_NAME
-        bkg_reg = workdir / WORK_BKG_REGION_NAME
-        if not src_reg.is_file() or not bkg_reg.is_file():
-            raise FileNotFoundError(f"source/background region files were not found in {workdir}")
-        mkf = None
-        if RESPONSE_FILES_MODE != "existing":
-            mkf = mkf_file if mkf_file is not None else resolve_mkf_file(None, project_dir, eventfile)
-        return eventfile, project_dir, mkf, src_reg, bkg_reg
+    def on_xspec_button(event) -> None:  # noqa: ARG001
+        state["xspec_processes"] = [
+            process for process in state["xspec_processes"] if process.poll() is None
+        ]
+        if state["xspec_processes"]:
+            terminal_warning("XSPEC is already running for the first GTI interval")
+            return
+        products_by_detector = state["first_gti_products"]
+        dual_workdir = state["first_gti_xspec_dir"]
+        if not products_by_detector or dual_workdir is None:
+            terminal_warning("no GTI spectrum is available; extract at least one interval first")
+            return
+        required = ("src_pha", "bkg_pha", "rmf", "arf")
+        for detector, products in products_by_detector.items():
+            missing = [
+                key
+                for key in required
+                if products.get(key) is None or not Path(products[key]).is_file()
+            ]
+            if missing:
+                terminal_warning(
+                    f"first GTI spectrum products are missing for {detector}",
+                    (("missing", ", ".join(missing)),),
+                )
+                return
+        try:
+            command, workdir = xspec_command_for_products(
+                products_by_detector,
+                dual_workdir=dual_workdir,
+            )
+            terminal_block("XSPEC", (("status", "opening first GTI"), ("workdir", workdir)))
+            process = launch_xspec_command(
+                command,
+                workdir=workdir,
+                module_name=module_name,
+                modules_init=modules_init,
+            )
+        except Exception as exc:
+            terminal_warning("could not launch XSPEC for the first GTI", (("detail", exc),))
+            return
+        state["xspec_processes"].append(process)
+
+    xspec_button = OverlayButton(top_ax, (0.69, 1.008), (0.14, 0.07), "XSPEC", on_xspec_button, fontsize=11)
+
+    def prepared_tracks() -> list[dict]:
+        prepared = []
+        for track in tracks:
+            workdir = track["source_path"].parent
+            src_reg = workdir / WORK_SRC_REGION_NAME
+            bkg_reg = workdir / WORK_BKG_REGION_NAME
+            if not src_reg.is_file() or not bkg_reg.is_file():
+                raise FileNotFoundError(f"source/background region files were not found in {workdir}")
+            mkf = None
+            if RESPONSE_FILES_MODE != "existing":
+                mkf = track["mkf"] if track.get("mkf") is not None else resolve_mkf_file(None, track["project_dir"], track["eventfile"])
+            prepared.append({**track, "src_reg": src_reg, "bkg_reg": bkg_reg, "mkf_resolved": mkf})
+        return prepared
 
     def run_interval_extraction() -> None:
         if state["extracting"]:
@@ -1270,14 +1851,23 @@ def install_lightcurve_rebin_controls(
         if not intervals:
             terminal_warning("no GTI intervals selected")
             return
+        if not has_event_context:
+            terminal_warning("GTI spectrum selection is unavailable; missing event context")
+            return
         state["extracting"] = True
+        state["first_gti_products"] = None
+        state["first_gti_xspec_dir"] = None
         started = time.monotonic()
         marker = None
         try:
-            evt, project, mkf, src_reg, bkg_reg = extraction_context()
-            base_time, template_header = lightcurve_time_base_seconds(state["display_path"])
-            spectrum_root = state["source_path"].parent.parent / NAMES.spec_workdir_name(evt)
-            output_root = prepare_overwrite_dir(spectrum_root / "gti_spectra")
+            prepared = prepared_tracks()
+            base_time, template_header = lightcurve_time_base_seconds(tracks[0]["display_path"])
+            extract_root = tracks[0]["source_path"].parent.parent
+            if dual:
+                output_root = prepare_overwrite_dir(dual_gti_dir(extract_root))
+            else:
+                spectrum_root = extract_root / NAMES.spec_workdir_name(tracks[0]["eventfile"])
+                output_root = prepare_overwrite_dir(spectrum_root / "gti_spectra")
             # Marker so the main viewer can show the "gtispec" label white while this runs.
             marker = output_root / ".extracting"
             marker.write_text("")
@@ -1285,10 +1875,11 @@ def install_lightcurve_rebin_controls(
                 "GTI spectrum extraction",
                 (
                     ("intervals", len(intervals)),
+                    ("detectors", len(tracks)),
                     ("output", output_root),
                 ),
             )
-            products = []
+            groups = 0
             for index, (x_start, x_stop) in enumerate(intervals, 1):
                 label = f"gti{index:02d}"
                 start = base_time + max(0.0, min(x_start, x_stop))
@@ -1297,31 +1888,72 @@ def install_lightcurve_rebin_controls(
                     continue
                 gti_file = output_root / f"{label}.gti"
                 write_interval_gti(gti_file, start, stop, template_header)
-                products.append(
-                    extract_interval_spectrum_with_heasoft(
-                        eventfile=evt,
-                        project_dir=project,
-                        mkf_file=mkf,
-                        src_reg=src_reg,
-                        bkg_reg=bkg_reg,
-                        start=start,
-                        stop=stop,
-                        gti_file=gti_file,
-                        output_root=output_root,
-                        label=label,
-                        psfcor=psfcor,
-                        module_name=module_name,
-                        modules_init=modules_init,
+                if dual:
+                    interval_root = prepare_overwrite_dir(output_root / label)
+                    errors: dict[str, Exception] = {}
+                    interval_products: dict[str, dict[str, Path]] = {}
+
+                    def run(track, start=start, stop=stop, gti_file=gti_file, interval_root=interval_root):
+                        try:
+                            products = extract_interval_spectrum_with_heasoft(
+                                eventfile=track["eventfile"], project_dir=track["project_dir"], mkf_file=track["mkf_resolved"],
+                                src_reg=track["src_reg"], bkg_reg=track["bkg_reg"], start=start, stop=stop, gti_file=gti_file,
+                                output_root=interval_root, label=track["detector"], psfcor=psfcor,
+                                module_name=module_name, modules_init=modules_init,
+                            )
+                            for min_counts in (3, 20):
+                                try:
+                                    run_grppha(products["src_pha"], min_counts, module_name, modules_init)
+                                except Exception as exc:
+                                    terminal_warning(
+                                        f"grppha rebin {min_counts} failed ({label}/{track['detector']})",
+                                        (("detail", exc),),
+                                    )
+                            interval_products[track["detector"]] = products
+                        except Exception as exc:  # noqa: BLE001 -- reported per detector
+                            errors[track["detector"]] = exc
+
+                    threads = [threading.Thread(target=run, args=(track,)) for track in prepared]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join()
+                    if errors:
+                        detail = "; ".join(f"{det}: {exc}" for det, exc in errors.items())
+                        terminal_warning(f"GTI interval {label} failed", (("detail", detail),))
+                    else:
+                        groups += 1
+                        if index == 1:
+                            state["first_gti_products"] = interval_products
+                            state["first_gti_xspec_dir"] = interval_root / "xspec-products"
+                else:
+                    track = prepared[0]
+                    products = extract_interval_spectrum_with_heasoft(
+                        eventfile=track["eventfile"], project_dir=track["project_dir"], mkf_file=track["mkf_resolved"],
+                        src_reg=track["src_reg"], bkg_reg=track["bkg_reg"], start=start, stop=stop, gti_file=gti_file,
+                        output_root=output_root, label=label, psfcor=psfcor,
+                        module_name=module_name, modules_init=modules_init,
                     )
-                )
-            terminal_block(
-                "GTI spectra ready",
-                (
-                    ("elapsed", f"{time.monotonic() - started:.1f}s"),
-                    ("groups", len(products)),
-                    ("output", output_root),
-                ),
-            )
+                    for min_counts in (3, 20):
+                        try:
+                            run_grppha(products["src_pha"], min_counts, module_name, modules_init)
+                        except Exception as exc:
+                            terminal_warning(
+                                f"grppha rebin {min_counts} failed ({label})",
+                                (("detail", exc),),
+                            )
+                    groups += 1
+                    if index == 1:
+                        state["first_gti_products"] = {track["detector"]: products}
+                        state["first_gti_xspec_dir"] = products["workdir"]
+            rows = [
+                ("elapsed", f"{time.monotonic() - started:.1f}s"),
+                ("groups", groups),
+                ("output", output_root),
+            ]
+            if state["first_gti_products"]:
+                rows.append(("next", "press x or click XSPEC to load gti01"))
+            terminal_block("GTI spectra ready", rows)
         except Exception as exc:
             terminal_warning("GTI spectrum extraction failed", (("detail", exc),))
         finally:
@@ -1373,12 +2005,15 @@ def install_lightcurve_rebin_controls(
         if key in {"g"}:
             on_gti_button(event)
             return
+        if key == "x":
+            on_xspec_button(event)
+            return
         if key in {"enter", "return"} and (state["interval_mode"] or state["intervals"]):
             extract_intervals_async()
             return
         if key == "u" and state["intervals"]:
             state["intervals"].pop()
-            redraw(state["display_path"])
+            redraw()
             return
         if key == "escape" and (state["interval_mode"] or state["intervals"]):
             state["intervals"].clear()
@@ -1392,7 +2027,7 @@ def install_lightcurve_rebin_controls(
         state["bin"] = max(1.0, state["bin"] + delta)
         state["custom_bin"] = True
         terminal_line(f"LC bin -> {format_lc_bin(state['bin'])}")
-        display_source(state["source_path"])
+        display_all()
 
     def on_key_release(event) -> None:
         released = _parse_modifiers(getattr(event, "key", None) or "")
@@ -1402,11 +2037,82 @@ def install_lightcurve_rebin_controls(
 
     fig.canvas.mpl_connect("key_press_event", on_key)
     fig.canvas.mpl_connect("key_release_event", on_key_release)
-    redraw(initial_path)
-    state["display_source"] = display_source
+    redraw()
+    state["set_track_source"] = set_track_source
+    # Back-compat single-track hook used by the watch poller.
+    state["display_source"] = lambda path: set_track_source(tracks[0], path)
     fig._ds8_lc_span_selector = span_selector
     fig._ds8_lc_gti_button = gti_button
+    fig._ds8_lc_xspec_button = xspec_button
     return state
+
+
+def _lc_track(ax, path: Path, title: str, detector: str,
+              eventfile: Path | None, project_dir: Path | None, mkf_file: Path | None) -> dict:
+    return {
+        "ax": ax,
+        "source_path": path,
+        "display_path": path,
+        "source_mtime": None,
+        "title": title,
+        "detector": detector,
+        "eventfile": eventfile,
+        "project_dir": project_dir,
+        "mkf": mkf_file,
+    }
+
+
+def attach_lc_watch(fig, state: dict, watch_pairs: list[tuple[Path, dict]]) -> None:
+    """Poll each ``(watch_path, track)`` pair and live-refresh that track when the
+    watch file points at a newer light curve."""
+    for _, track in watch_pairs:
+        track["source_mtime"] = path_mtime_ns(track["source_path"])
+
+    def poll_watch_file() -> bool:
+        for watch_path, track in watch_pairs:
+            try:
+                next_path = read_lc_watch_file(watch_path)
+                if next_path is None or not next_path.is_file():
+                    continue
+                next_mtime = path_mtime_ns(next_path)
+                if next_path == track["source_path"] and next_mtime == track.get("source_mtime"):
+                    continue
+                track["source_mtime"] = next_mtime
+                state["set_track_source"](track, next_path)
+            except Exception as exc:
+                message = str(exc)
+                if message != state["last_error"]:
+                    terminal_warning("could not refresh LC window", (("detail", message),))
+                    state["last_error"] = message
+        return True
+
+    timer = fig.canvas.new_timer(interval=40)
+    timer.add_callback(poll_watch_file)
+    timer.start()
+    fig._ds8_lc_timer = timer
+
+
+def plot_lightcurve_dual(
+    tracks_spec: list[dict],
+    lc_bin: float,
+    module_name: str,
+    modules_init: str,
+    psfcor: float = 1.0,
+    watch_paths: list[Path | None] | None = None,
+):
+    n = len(tracks_spec)
+    fig, axes = plt.subplots(n, 1, figsize=(9.0, 4.4 * n), sharex=True, facecolor="black")
+    axes = np.atleast_1d(axes)
+    tracks = [
+        _lc_track(axes[i], spec["path"], spec["title"], spec["detector"], spec["eventfile"], spec["project_dir"], spec["mkf"])
+        for i, spec in enumerate(tracks_spec)
+    ]
+    state = install_lightcurve_rebin_controls(fig, tracks, lc_bin, module_name, modules_init, psfcor)
+    if watch_paths:
+        pairs = [(wp, tracks[i]) for i, wp in enumerate(watch_paths) if wp is not None and i < len(tracks)]
+        if pairs:
+            attach_lc_watch(fig, state, pairs)
+    return fig
 
 
 def plot_lightcurve(
@@ -1423,15 +2129,10 @@ def plot_lightcurve(
     fig, ax = plt.subplots(figsize=(8, 4.6), facecolor="black")
     install_lightcurve_rebin_controls(
         fig,
-        ax,
-        path,
-        title,
+        [_lc_track(ax, path, title, "single", eventfile, project_dir, mkf_file)],
         lc_bin,
         module_name,
         modules_init,
-        eventfile,
-        project_dir,
-        mkf_file,
         psfcor,
     )
     return fig
@@ -1492,44 +2193,9 @@ def plot_lightcurve_watch(
     psfcor: float = 1.0,
 ):
     fig, ax = plt.subplots(figsize=(8, 4.6), facecolor="black")
-    state = install_lightcurve_rebin_controls(
-        fig,
-        ax,
-        initial_path,
-        title,
-        lc_bin,
-        module_name,
-        modules_init,
-        eventfile,
-        project_dir,
-        mkf_file,
-        psfcor,
-    )
-    state["source_mtime"] = path_mtime_ns(initial_path)
-
-    def poll_watch_file() -> bool:
-        try:
-            next_path = read_lc_watch_file(watch_path)
-            if next_path is None:
-                return True
-            if not next_path.is_file():
-                return True
-            next_mtime = path_mtime_ns(next_path)
-            if next_path == state["source_path"] and next_mtime == state.get("source_mtime"):
-                return True
-            state["source_mtime"] = next_mtime
-            state["display_source"](next_path)
-        except Exception as exc:
-            message = str(exc)
-            if message != state["last_error"]:
-                terminal_warning("could not refresh LC window", (("detail", message),))
-                state["last_error"] = message
-        return True
-
-    timer = fig.canvas.new_timer(interval=40)
-    timer.add_callback(poll_watch_file)
-    timer.start()
-    fig._ds8_lc_timer = timer
+    track = _lc_track(ax, initial_path, title, "single", eventfile, project_dir, mkf_file)
+    state = install_lightcurve_rebin_controls(fig, [track], lc_bin, module_name, modules_init, psfcor)
+    attach_lc_watch(fig, state, [(watch_path, track)])
     return fig
 
 
@@ -1931,28 +2597,151 @@ class OverlayButton:
         self.label.set_visible(visible)
 
 
+class SkyRegion:
+    """Detector-independent region geometry: the single source of truth shared by
+    every panel. ``center`` is a :class:`~astropy.coordinates.SkyCoord` and radii are
+    in degrees when a celestial WCS is available (``sky=True``); otherwise (a single
+    frame with no WCS) ``center`` is an ``(x, y)`` pixel tuple and radii are pixels.
+    """
+
+    def __init__(self, center, radius, inner_radius=0.0, region_type="circle", *, sky=True):
+        self.center = center
+        self.radius = float(radius)
+        self.inner_radius = float(inner_radius)
+        self.region_type = region_type
+        self.sky = sky
+
+    @classmethod
+    def from_pixels(cls, wcs, x, y, radius, inner_radius=0.0, region_type="circle"):
+        region = cls((float(x), float(y)), radius, inner_radius, region_type, sky=wcs is not None)
+        region.update_from_pixels(wcs, x, y, radius, inner_radius)
+        return region
+
+    def project(self, wcs):
+        """Return ``(x, y, radius_px, inner_px)`` in the pixel frame of ``wcs``."""
+        if not self.sky or wcs is None:
+            x, y = self.center
+            return float(x), float(y), float(self.radius), float(self.inner_radius)
+        x, y = wcs.world_to_pixel(self.center)
+        radius = angular_radius_to_pixels(wcs, self.center, self.radius)
+        inner = angular_radius_to_pixels(wcs, self.center, self.inner_radius) if self.inner_radius > 0 else 0.0
+        return float(x), float(y), float(radius), float(inner)
+
+    def update_center_from_pixels(self, wcs, x, y):
+        if not self.sky or wcs is None:
+            self.center = (float(x), float(y))
+        else:
+            self.center = wcs.pixel_to_world(x, y)
+
+    def update_from_pixels(self, wcs, x, y, radius, inner_radius=0.0):
+        self.update_center_from_pixels(wcs, x, y)
+        if not self.sky or wcs is None:
+            self.radius = float(radius)
+            self.inner_radius = float(inner_radius)
+        else:
+            self.radius = pixel_radius_to_angular(wcs, self.center, radius)
+            self.inner_radius = pixel_radius_to_angular(wcs, self.center, inner_radius) if inner_radius > 0 else 0.0
+
+    def key(self, ndigits: int = 8) -> tuple:
+        """Rounded, hashable signature of the geometry for change detection."""
+        if not self.sky:
+            cx, cy = self.center
+            return (round(float(cx), 6), round(float(cy), 6), round(self.radius, 6), round(self.inner_radius, 6), self.region_type)
+        return (
+            round(float(self.center.ra.deg), ndigits),
+            round(float(self.center.dec.deg), ndigits),
+            round(self.radius, ndigits + 2),
+            round(self.inner_radius, ndigits + 2),
+            self.region_type,
+        )
+
+    def copy(self) -> "SkyRegion":
+        return SkyRegion(self.center, self.radius, self.inner_radius, self.region_type, sky=self.sky)
+
+
+class DetectorPanel:
+    """Per-detector view bundle: frame data, main axes + source-zoom inset, image
+    artists, region patches, handles/highlights/inset widgets, a viewport cache, and a
+    pixel-geometry cache projected from the shared :class:`SkyRegion` model.
+    """
+
+    def __init__(
+        self,
+        *,
+        detector: str,
+        label: str,
+        frame,
+        masked_counts,
+        eventfile: Path,
+        project_dir: Path,
+        mkf_file: Path | None,
+        ax,
+        inset,
+        image,
+        inset_image,
+        src_patches,
+        bkg_patches,
+        reference_artists,
+        src_reg: Path,
+        bkg_reg: Path,
+    ) -> None:
+        self.detector = detector
+        self.label = label
+        self.frame = frame
+        self.counts = frame.counts
+        self.masked_counts = masked_counts
+        self.wcs = frame.wcs
+        self.eventfile = eventfile
+        self.project_dir = project_dir
+        self.mkf_file = mkf_file
+        self.ax = ax
+        self.inset = inset
+        self.image = image
+        self.inset_image = inset_image
+        self.src_patches = src_patches
+        self.bkg_patches = bkg_patches
+        self.reference_artists = reference_artists
+        self.src_reg = src_reg
+        self.bkg_reg = bkg_reg
+        # Pixel-geometry cache, projected from the shared model by the controller.
+        self.src_x = self.src_y = self.src_radius = self.src_inner_radius = 0.0
+        self.bkg_x = self.bkg_y = self.bkg_radius = self.bkg_inner_radius = 0.0
+        self.half_width = 0.0
+        self.bounds = (0.0, 1.0, 0.0, 1.0)
+        # Visuals populated by the controller in __init__.
+        self.handles: dict[str, Rectangle] = {}
+        self.inset_move_handle: Rectangle | None = None
+        self.inset_rect: Rectangle | None = None
+        self.connectors: list[Line2D] = []
+        self.src_inner_patches: tuple = ()
+        self.bkg_inner_patches: tuple = ()
+        self.src_highlight = None
+        self.bkg_highlight = None
+        self.source_coord_text = None
+        self.coord_button = None
+        self.save_button = None
+        # Per-panel initial view state for the reset ('R') key.
+        self.initial_main_xlim = tuple(ax.get_xlim())
+        self.initial_main_ylim = tuple(ax.get_ylim())
+        self.initial_inset_position = tuple(inset.get_position().bounds)
+
+
+def dual_gti_dir(extract_root: Path) -> Path:
+    """Shared directory both the dual light-curve window (writer) and the dual viewer
+    (poller) agree on for GTI interval spectra. Both derive it from the same root."""
+    return extract_root / "ds8-dual-gti_spectra"
+
+
 class InteractiveZoom:
     def __init__(
         self,
         *,
         fig,
-        ax,
-        inset,
-        counts,
-        masked_counts,
-        image,
-        inset_image,
-        wcs,
-        eventfile: Path,
-        project_dir: Path,
-        src_reg: Path,
-        bkg_reg: Path,
-        src_circle,
-        bkg_circle,
-        src_region,
-        bkg_region,
-        src_patches,
-        bkg_patches,
+        panels: list,
+        src_region: "SkyRegion",
+        bkg_region: "SkyRegion",
+        src_region_type: str,
+        bkg_region_type: str,
         zoom_factor: float,
         output: Path,
         dpi: int,
@@ -1963,26 +2752,26 @@ class InteractiveZoom:
         extract_dir: str,
         module_name: str,
         modules_init: str,
-        mkf_file: Path | None,
         psfcor: float,
         drag_region_body: bool = False,
     ) -> None:
         self.fig = fig
-        self.ax = ax
-        self.inset = inset
-        self.counts = counts
-        self.masked_counts = masked_counts
-        self.image = image
-        self.inset_image = inset_image
-        self.wcs = wcs
-        self.eventfile = eventfile
-        self.project_dir = project_dir
-        self.src_reg = src_reg
-        self.bkg_reg = bkg_reg
-        self.src_circle = src_circle
-        self.bkg_circle = bkg_circle
-        self.src_patches = src_patches
-        self.bkg_patches = bkg_patches
+        self.panels = panels
+        self.active_panel = panels[0]
+        self.pan_panel = panels[0]
+        self.primary = panels[0]
+        self.dual = len(panels) > 1
+        # Shared, detector-independent region model (single source of truth).
+        self.src = src_region
+        self.bkg = bkg_region
+        self.src.region_type = src_region_type
+        self.bkg.region_type = bkg_region_type
+        # Controller-level convenience refs (primary panel context for extraction root,
+        # watch files, etc.). Extraction fans out over self.panels.
+        self.project_dir = self.primary.project_dir
+        self.eventfile = self.primary.eventfile
+        self.wcs = self.primary.wcs
+        self.mkf_file = self.primary.mkf_file
         self.output = output
         self.dpi = dpi
         self.dragging = False
@@ -1994,35 +2783,19 @@ class InteractiveZoom:
         self.pan_start = (0.0, 0.0)
         self.pan_xlim = (0.0, 1.0)
         self.pan_ylim = (0.0, 1.0)
-        self.initial_main_xlim = tuple(ax.get_xlim())
-        self.initial_main_ylim = tuple(ax.get_ylim())
-        self.half_width = src_circle.radius * zoom_factor
-        self.connectors: list[Line2D] = []
-        self.handles: dict[str, Rectangle] = {}
-        self.inset_move_handle: Rectangle | None = None
-        self.src_x = float(src_circle.x)
-        self.src_y = float(src_circle.y)
-        self.src_radius = float(src_circle.radius)
-        self.bkg_x = float(bkg_circle.x)
-        self.bkg_y = float(bkg_circle.y)
-        self.bkg_radius = float(bkg_circle.radius)
-        self.src_inner_radius = float(src_region.inner_radius) if isinstance(src_region, PixelAnnulus) else 0.0
-        self.bkg_inner_radius = float(bkg_region.inner_radius) if isinstance(bkg_region, PixelAnnulus) else 0.0
-        self.src_region_type = "annulus" if isinstance(src_region, PixelAnnulus) and src_region.inner_radius > 0 else "circle"
-        self.bkg_region_type = "annulus" if isinstance(bkg_region, PixelAnnulus) and bkg_region.inner_radius > 0 else "circle"
-        self.initial_src = (self.src_x, self.src_y)
-        self.initial_bkg = (self.bkg_x, self.bkg_y)
-        self.initial_src_radius = self.src_radius
-        self.initial_bkg_radius = self.bkg_radius
-        self.initial_src_inner_radius = self.src_inner_radius
-        self.initial_bkg_inner_radius = self.bkg_inner_radius
-        self.initial_src_region_type = self.src_region_type
-        self.initial_bkg_region_type = self.bkg_region_type
+        # Shared logical region type (per region); geometry lives in the sky model.
+        self.src_region_type = src_region_type
+        self.bkg_region_type = bkg_region_type
+        # Initial model snapshot for the reset ('R') key.
+        self.initial_src_model = src_region.copy()
+        self.initial_bkg_model = bkg_region.copy()
+        self.initial_src_region_type = src_region_type
+        self.initial_bkg_region_type = bkg_region_type
         self.initial_zoom_factor = zoom_factor
-        self.src_label_original = src_reg.name
-        self.bkg_label_original = bkg_reg.name
-        self.src_label_moved = f"ds8-{src_reg.name}"
-        self.bkg_label_moved = f"ds8-{bkg_reg.name}"
+        self.zoom_factor = zoom_factor
+        self._viewport_images: dict[int, object] = {}
+        self._viewport_panel: dict[int, DetectorPanel] = {}
+        self._viewport_state: dict[int, tuple] = {}
         self.lc_bin = lc_bin
         self.pha_min = pha_min
         self.pha_max = pha_max
@@ -2030,16 +2803,15 @@ class InteractiveZoom:
         self.extract_dir = extract_dir
         self.module_name = module_name
         self.modules_init = modules_init
-        self.mkf_file = mkf_file
         self.psfcor = psfcor
         self.drag_region_body = drag_region_body
-        self.initial_inset_position = tuple(inset.get_position().bounds)
         self.lightcurve_processes: list[subprocess.Popen] = []
         self.xspec_processes: list[subprocess.Popen] = []
         self.next_extract = "lightcurve"
-        self.last_lightcurve_path: Path | None = None
+        # Detector -> product mappings (single mode carries a single entry).
+        self.last_lightcurve_paths: dict[str, Path] = {}
         self.last_lightcurve_signature: tuple | None = None
-        self.last_spectrum_products: dict[str, Path] | None = None
+        self.last_spectrum_products: dict[str, dict] | None = None
         self.last_spectrum_signature: tuple | None = None
         # Product-status tracking for the floating labels. These persist across region
         # moves (unlike last_*_signature which get cleared) so a moved region can show red.
@@ -2062,54 +2834,51 @@ class InteractiveZoom:
         self.live_lc_lock = threading.Lock()
         self.closed = False
         self.coord_format = "deg"
-        self.base_title = ax.get_title()
-        self.source_coord_text = ax.text(
-            0.5,
-            1.028,
-            "",
-            transform=ax.transAxes,
-            color="white",
-            fontsize=9,
-            ha="center",
-            va="center",
-            zorder=20,
-        )
-        # deg/hms toggle and "save" button, both built from the shared OverlayButton entity
-        # so they position and behave identically. transAxes -> pinned to this axes.
-        self.coord_button = OverlayButton(
-            ax, (0.84, 1.012), (0.056, 0.032), "deg", lambda event: self.toggle_coord_format(), fontsize=7
-        )
-        if self.wcs is None:
-            self.coord_button.set_visible(False)
-        # "save" button (right of the deg/hms toggle): writes the current regions to new
-        # ds8-prefixed files without touching the originals.
-        self.save_button = OverlayButton(
-            ax, (0.906, 1.012), (0.064, 0.032), "save", lambda event: self.save_regions(), fontsize=7
-        )
-        self.overlay_buttons = [self.coord_button, self.save_button]
+        self.base_title = self.primary.ax.get_title()
+        self.overlay_buttons: list[OverlayButton] = []
+        self.reference_visible = True
 
-        self.bounds = square_window_inside_frame(self.src_x, self.src_y, self.half_width, counts)
-        x0, x1, y0, y1 = self.bounds
-        self.inset_rect = Rectangle(
-            (0, 0),
-            1,
-            1,
-            transform=inset.transAxes,
-            fill=False,
-            ec="white",
-            lw=1.0,
-            alpha=0.95,
-            clip_on=False,
-            zorder=8,
-        )
-        inset.add_patch(self.inset_rect)
-        # Floating product-status labels pinned to the source region's lower-left corner
-        # with fixed (zoom-independent) size and spacing. Light green when the product
-        # matches the current regions, red once the regions have moved.
+        # Build per-panel widgets. Each panel projects the shared model into its own
+        # pixel frame, then gets its own coord/save buttons, coord text, inset rect,
+        # highlights, inner patches, handles, and viewport renderer.
+        for panel in self.panels:
+            self._project_panel_geometry(panel)
+            panel.coord_button = OverlayButton(
+                panel.ax, (0.84, 1.012), (0.056, 0.032), "deg", lambda event: self.toggle_coord_format(), fontsize=7
+            )
+            if panel.wcs is None:
+                panel.coord_button.set_visible(False)
+            panel.save_button = OverlayButton(
+                panel.ax, (0.906, 1.012), (0.064, 0.032), "save", lambda event: self.save_regions(), fontsize=7
+            )
+            self.overlay_buttons.extend([panel.coord_button, panel.save_button])
+            panel.source_coord_text = panel.ax.text(
+                0.5, 1.028, "", transform=panel.ax.transAxes, color="white",
+                fontsize=9, ha="center", va="center", zorder=20,
+            )
+            panel.inset_rect = Rectangle(
+                (0, 0), 1, 1, transform=panel.inset.transAxes, fill=False,
+                ec="white", lw=1.0, alpha=0.95, clip_on=False, zorder=8,
+            )
+            panel.inset.add_patch(panel.inset_rect)
+            panel.src_highlight = Circle(
+                (panel.src_x, panel.src_y), panel.src_radius, fill=False, ec="yellow", lw=1.6, alpha=0.0, zorder=9,
+            )
+            panel.bkg_highlight = Circle(
+                (panel.bkg_x, panel.bkg_y), panel.bkg_radius, fill=False, ec="yellow", lw=1.6, alpha=0.0, zorder=9,
+            )
+            panel.ax.add_patch(panel.src_highlight)
+            panel.ax.add_patch(panel.bkg_highlight)
+            panel.src_inner_patches = self._make_inner_patches(panel, "src")
+            panel.bkg_inner_patches = self._make_inner_patches(panel, "bkg")
+            self.create_handles(panel)
+            self._install_viewport_rendering(panel)
+
+        # Floating product-status labels live on the primary panel next to its title.
         _status_kwargs = dict(fontsize=7, ha="left", va="center", fontweight="bold", zorder=9, clip_on=False)
-        self.curve_label = ax.text(0, 0, "curve", color="lightgreen", **_status_kwargs)
-        self.spec_label = ax.text(0, 0, "spec", color="lightgreen", **_status_kwargs)
-        self.gtispec_label = ax.text(0, 0, "gtispec", color="lightgreen", **_status_kwargs)
+        self.curve_label = self.primary.ax.text(0, 0, "curve", color="lightgreen", **_status_kwargs)
+        self.spec_label = self.primary.ax.text(0, 0, "spec", color="lightgreen", **_status_kwargs)
+        self.gtispec_label = self.primary.ax.text(0, 0, "gtispec", color="lightgreen", **_status_kwargs)
         self.status_labels = (
             (self.curve_label, "lc_status_sig", "lc_running"),
             (self.spec_label, "spec_status_sig", "spec_running"),
@@ -2117,33 +2886,10 @@ class InteractiveZoom:
         )
         for _label, _, _ in self.status_labels:
             _label.set_visible(False)
-        self.src_highlight = Circle(
-            (self.src_x, self.src_y),
-            self.src_radius,
-            fill=False,
-            ec="yellow",
-            lw=1.6,
-            alpha=0.0,
-            zorder=9,
-        )
-        self.bkg_highlight = Circle(
-            (self.bkg_x, self.bkg_y),
-            self.bkg_radius,
-            fill=False,
-            ec="yellow",
-            lw=1.6,
-            alpha=0.0,
-            zorder=9,
-        )
-        ax.add_patch(self.src_highlight)
-        ax.add_patch(self.bkg_highlight)
 
-        self.src_inner_patches = self._make_inner_patches("src")
-        self.bkg_inner_patches = self._make_inner_patches("bkg")
-        self.create_handles()
-        self.apply_bounds()
-        self.update_source_coord_text()
-        self._install_viewport_rendering()
+        for panel in self.panels:
+            self.apply_bounds(panel)
+            self.update_source_coord_text(panel)
 
         self.cids = [
             fig.canvas.mpl_connect("button_press_event", self.on_press),
@@ -2159,28 +2905,38 @@ class InteractiveZoom:
         self.status_timer.add_callback(self._poll_status)
         self.status_timer.start()
 
+    def _project_panel_geometry(self, panel) -> None:
+        """Fill a panel's pixel-geometry cache (and derived half_width/bounds) from the
+        shared sky model, using that panel's WCS."""
+        sx, sy, sr, sir = self.src.project(panel.wcs)
+        bx, by, br, bir = self.bkg.project(panel.wcs)
+        panel.src_x, panel.src_y, panel.src_radius, panel.src_inner_radius = sx, sy, sr, sir
+        panel.bkg_x, panel.bkg_y, panel.bkg_radius, panel.bkg_inner_radius = bx, by, br, bir
+        panel.half_width = sr * self.zoom_factor
+        panel.bounds = square_window_inside_frame(sx, sy, panel.half_width, panel.counts)
+
     REGION_TYPES = ["circle", "annulus"]
 
-    def _make_inner_patches(self, group: str) -> tuple:
-        x = self.src_x if group == "src" else self.bkg_x
-        y = self.src_y if group == "src" else self.bkg_y
-        ir = self.src_inner_radius if group == "src" else self.bkg_inner_radius
+    def _make_inner_patches(self, panel, group: str) -> tuple:
+        x = panel.src_x if group == "src" else panel.bkg_x
+        y = panel.src_y if group == "src" else panel.bkg_y
+        ir = panel.src_inner_radius if group == "src" else panel.bkg_inner_radius
         rtype = self.src_region_type if group == "src" else self.bkg_region_type
         color = "red" if group == "src" else "cyan"
         visible = rtype == "annulus" and ir > 0
         patches = []
-        for target_ax in (self.ax, self.inset):
+        for target_ax in (panel.ax, panel.inset):
             c = Circle((x, y), max(ir, 1.0), fill=False, lw=1.1, ec=color, ls="--", zorder=5)
             c.set_visible(visible)
             target_ax.add_patch(c)
             patches.append(c)
         return tuple(patches)
 
-    def _update_inner_patches(self, group: str) -> None:
-        patches = self.src_inner_patches if group == "src" else self.bkg_inner_patches
-        x = self.src_x if group == "src" else self.bkg_x
-        y = self.src_y if group == "src" else self.bkg_y
-        ir = self.src_inner_radius if group == "src" else self.bkg_inner_radius
+    def _update_inner_patches(self, panel, group: str) -> None:
+        patches = panel.src_inner_patches if group == "src" else panel.bkg_inner_patches
+        x = panel.src_x if group == "src" else panel.bkg_x
+        y = panel.src_y if group == "src" else panel.bkg_y
+        ir = panel.src_inner_radius if group == "src" else panel.bkg_inner_radius
         rtype = self.src_region_type if group == "src" else self.bkg_region_type
         visible = rtype == "annulus" and ir > 0
         for p in patches:
@@ -2188,8 +2944,8 @@ class InteractiveZoom:
             p.set_radius(max(ir, 1.0))
             p.set_visible(visible)
 
-    def make_handle(self, name: str, color: str) -> None:
-        size = self.handle_size()
+    def make_handle(self, panel, name: str, color: str) -> None:
+        size = self.handle_size(panel)
         handle = Rectangle(
             (0.0, 0.0),
             size,
@@ -2201,19 +2957,19 @@ class InteractiveZoom:
             zorder=12,
             label="_nolegend_",
         )
-        self.ax.add_patch(handle)
-        self.handles[name] = handle
+        panel.ax.add_patch(handle)
+        panel.handles[name] = handle
 
-    def create_handles(self) -> None:
-        self.make_handle("src_move", "red")
-        self.make_handle("src_resize", "red")
-        self.make_handle("src_inner_resize", "red")
-        self.make_handle("bkg_move", "cyan")
-        self.make_handle("bkg_resize", "cyan")
-        self.make_handle("bkg_inner_resize", "#66cccc")
-        self.make_inset_handle()
+    def create_handles(self, panel) -> None:
+        self.make_handle(panel, "src_move", "red")
+        self.make_handle(panel, "src_resize", "red")
+        self.make_handle(panel, "src_inner_resize", "red")
+        self.make_handle(panel, "bkg_move", "cyan")
+        self.make_handle(panel, "bkg_resize", "cyan")
+        self.make_handle(panel, "bkg_inner_resize", "#66cccc")
+        self.make_inset_handle(panel)
 
-    def make_inset_handle(self) -> None:
+    def make_inset_handle(self, panel) -> None:
         width, height = self.figure_handle_size()
         handle = Rectangle(
             (0.0, 0.0),
@@ -2229,49 +2985,49 @@ class InteractiveZoom:
             label="_nolegend_",
         )
         self.fig.add_artist(handle)
-        self.inset_move_handle = handle
+        panel.inset_move_handle = handle
 
-    def handle_size(self) -> float:
-        x0, x1 = self.ax.get_xlim()
-        y0, y1 = self.ax.get_ylim()
+    def handle_size(self, panel) -> float:
+        x0, x1 = panel.ax.get_xlim()
+        y0, y1 = panel.ax.get_ylim()
         return max(3.0, 0.012 * max(abs(x1 - x0), abs(y1 - y0)))
 
     def figure_handle_size(self) -> tuple[float, float]:
         width_px, height_px = self.fig.canvas.get_width_height()
         return 10.0 / max(width_px, 1), 10.0 / max(height_px, 1)
 
-    def place_handle(self, name: str, x: float, y: float) -> None:
-        size = self.handle_size()
-        handle = self.handles[name]
+    def place_handle(self, panel, name: str, x: float, y: float) -> None:
+        size = self.handle_size(panel)
+        handle = panel.handles[name]
         handle.set_width(size)
         handle.set_height(size)
         handle.set_xy((x - 0.5 * size, y - 0.5 * size))
 
-    def place_inset_handle(self) -> None:
-        if self.inset_move_handle is None:
+    def place_inset_handle(self, panel) -> None:
+        if panel.inset_move_handle is None:
             return
         width, height = self.figure_handle_size()
-        bbox = self.inset.get_position()
-        self.inset_move_handle.set_width(width)
-        self.inset_move_handle.set_height(height)
-        self.inset_move_handle.set_xy((bbox.x1 - 0.5 * width, bbox.y1 - 0.5 * height))
+        bbox = panel.inset.get_position()
+        panel.inset_move_handle.set_width(width)
+        panel.inset_move_handle.set_height(height)
+        panel.inset_move_handle.set_xy((bbox.x1 - 0.5 * width, bbox.y1 - 0.5 * height))
 
-    def update_handles(self) -> None:
-        self.place_handle("src_resize", self.src_x + self.src_radius, self.src_y)
-        self.place_handle("src_move", self.src_x + self.src_radius, self.src_y + self.src_radius)
-        self.place_handle("bkg_resize", self.bkg_x + self.bkg_radius, self.bkg_y)
-        self.place_handle("bkg_move", self.bkg_x + self.bkg_radius, self.bkg_y + self.bkg_radius)
+    def update_handles(self, panel) -> None:
+        self.place_handle(panel, "src_resize", panel.src_x + panel.src_radius, panel.src_y)
+        self.place_handle(panel, "src_move", panel.src_x + panel.src_radius, panel.src_y + panel.src_radius)
+        self.place_handle(panel, "bkg_resize", panel.bkg_x + panel.bkg_radius, panel.bkg_y)
+        self.place_handle(panel, "bkg_move", panel.bkg_x + panel.bkg_radius, panel.bkg_y + panel.bkg_radius)
         if self.src_region_type == "annulus":
-            self.place_handle("src_inner_resize", self.src_x + self.src_inner_radius, self.src_y)
-            self.handles["src_inner_resize"].set_visible(True)
+            self.place_handle(panel, "src_inner_resize", panel.src_x + panel.src_inner_radius, panel.src_y)
+            panel.handles["src_inner_resize"].set_visible(True)
         else:
-            self.handles["src_inner_resize"].set_visible(False)
+            panel.handles["src_inner_resize"].set_visible(False)
         if self.bkg_region_type == "annulus":
-            self.place_handle("bkg_inner_resize", self.bkg_x + self.bkg_inner_radius, self.bkg_y)
-            self.handles["bkg_inner_resize"].set_visible(True)
+            self.place_handle(panel, "bkg_inner_resize", panel.bkg_x + panel.bkg_inner_radius, panel.bkg_y)
+            panel.handles["bkg_inner_resize"].set_visible(True)
         else:
-            self.handles["bkg_inner_resize"].set_visible(False)
-        self.place_inset_handle()
+            panel.handles["bkg_inner_resize"].set_visible(False)
+        self.place_inset_handle(panel)
 
     def handle_group(self, target: str | None) -> str | None:
         if target is None:
@@ -2284,38 +3040,42 @@ class InteractiveZoom:
             return "inset"
         return None
 
-    def _region_body_contains(self, group: str, x: float, y: float) -> bool:
+    def _region_body_contains(self, panel, group: str, x: float, y: float) -> bool:
         if group == "src":
-            cx, cy, radius, inner, rtype = self.src_x, self.src_y, self.src_radius, self.src_inner_radius, self.src_region_type
+            cx, cy, radius, inner, rtype = panel.src_x, panel.src_y, panel.src_radius, panel.src_inner_radius, self.src_region_type
         else:
-            cx, cy, radius, inner, rtype = self.bkg_x, self.bkg_y, self.bkg_radius, self.bkg_inner_radius, self.bkg_region_type
+            cx, cy, radius, inner, rtype = panel.bkg_x, panel.bkg_y, panel.bkg_radius, panel.bkg_inner_radius, self.bkg_region_type
         dist = math.hypot(x - cx, y - cy)
         if rtype == "annulus" and inner > 0:
             return inner <= dist <= radius
         return dist <= radius
 
     def update_highlights(self) -> None:
+        for panel in self.panels:
+            self._apply_highlights(panel)
+
+    def _apply_highlights(self, panel) -> None:
         active = self.selected_group or self.hover_group
-        self.src_highlight.set_alpha(0.9 if active == "src" else 0.0)
-        self.bkg_highlight.set_alpha(0.9 if active == "bkg" else 0.0)
+        panel.src_highlight.set_alpha(0.9 if active == "src" else 0.0)
+        panel.bkg_highlight.set_alpha(0.9 if active == "bkg" else 0.0)
         src_selected = active == "src"
         bkg_selected = active == "bkg"
         src_color = "yellow" if src_selected else "red"
         bkg_color = "yellow" if bkg_selected else "cyan"
         src_lw = 1.6 if src_selected else 1.1
         bkg_lw = 1.6 if bkg_selected else 1.1
-        self.src_inner_patches[0].set_edgecolor(src_color)
-        self.src_inner_patches[0].set_linewidth(src_lw)
-        self.src_inner_patches[1].set_edgecolor("red")
-        self.src_inner_patches[1].set_linewidth(src_lw)
-        for p in self.bkg_inner_patches:
+        panel.src_inner_patches[0].set_edgecolor(src_color)
+        panel.src_inner_patches[0].set_linewidth(src_lw)
+        panel.src_inner_patches[1].set_edgecolor("red")
+        panel.src_inner_patches[1].set_linewidth(src_lw)
+        for p in panel.bkg_inner_patches:
             p.set_edgecolor(bkg_color)
             p.set_linewidth(bkg_lw)
-        for name, handle in self.handles.items():
+        for name, handle in panel.handles.items():
             group = self.handle_group(name)
             handle.set_linewidth(1.6 if active == group else 0.8)
-        if self.inset_move_handle is not None:
-            self.inset_move_handle.set_linewidth(1.6 if active == "inset" else 0.8)
+        if panel.inset_move_handle is not None:
+            panel.inset_move_handle.set_linewidth(1.6 if active == "inset" else 0.8)
 
     def info(
         self,
@@ -2330,44 +3090,48 @@ class InteractiveZoom:
         else:
             terminal_line(message)
 
-    def source_coord_label(self) -> str:
-        if self.wcs is None:
-            return f"Source X={self.src_x + 1:.3f}, Y={self.src_y + 1:.3f}"
+    def source_coord_label(self, panel) -> str:
+        if panel.wcs is None:
+            return f"Source X={panel.src_x + 1:.3f}, Y={panel.src_y + 1:.3f}"
         try:
-            center = self.wcs.pixel_to_world(self.src_x, self.src_y)
+            center = panel.wcs.pixel_to_world(panel.src_x, panel.src_y)
             if self.coord_format == "hms":
                 ra_text = center.ra.to_string(unit=u.hourangle, sep=":", precision=2, pad=True)
                 dec_text = center.dec.to_string(unit=u.deg, sep=":", precision=2, alwayssign=True, pad=True)
                 return f"Source RA={ra_text}, Dec={dec_text}"
             return f"Source RA={center.ra.deg:.6f} deg, Dec={center.dec.deg:.6f} deg"
         except Exception:
-            return f"Source X={self.src_x + 1:.3f}, Y={self.src_y + 1:.3f}"
+            return f"Source X={panel.src_x + 1:.3f}, Y={panel.src_y + 1:.3f}"
 
-    def update_source_coord_text(self) -> None:
-        self.source_coord_text.set_text(self.source_coord_label())
-        self.coord_button.set_text(self.coord_format)
+    def update_source_coord_text(self, panel) -> None:
+        panel.source_coord_text.set_text(self.source_coord_label(panel))
+        panel.coord_button.set_text(self.coord_format)
 
     def toggle_coord_format(self) -> None:
-        if self.wcs is None:
+        if self.primary.wcs is None:
             return
         self.coord_format = "hms" if self.coord_format == "deg" else "deg"
-        self.update_source_coord_text()
+        for panel in self.panels:
+            self.update_source_coord_text(panel)
         self.fig.canvas.draw_idle()
 
     def save_regions(self) -> None:
         # Write current regions to new ds8-prefixed files; never overwrite originals.
-        src_out = self.src_reg.with_name(f"ds8-{self.src_reg.name}")
-        bkg_out = self.bkg_reg.with_name(f"ds8-{self.bkg_reg.name}")
+        # The regions are sky-linked, so one fk5 pair (from the primary panel) is
+        # canonical for every detector.
+        panel = self.primary
+        src_out = panel.src_reg.with_name(f"ds8-{panel.src_reg.name}")
+        bkg_out = panel.bkg_reg.with_name(f"ds8-{panel.bkg_reg.name}")
         try:
-            write_region(src_out, "src", self.src_x, self.src_y, self.src_radius, self.wcs, inner_radius=self.src_inner_radius)
-            write_region(bkg_out, "bkg", self.bkg_x, self.bkg_y, self.bkg_radius, self.wcs, inner_radius=self.bkg_inner_radius)
+            write_region(src_out, "src", panel.src_x, panel.src_y, panel.src_radius, panel.wcs, inner_radius=panel.src_inner_radius)
+            write_region(bkg_out, "bkg", panel.bkg_x, panel.bkg_y, panel.bkg_radius, panel.wcs, inner_radius=panel.bkg_inner_radius)
         except Exception as exc:
             self.warn("could not save regions", (("detail", exc),))
             return
         self.info("saved regions", (("src", src_out), ("bkg", bkg_out)), block=True)
 
-    def bounds_center(self) -> tuple[float, float]:
-        x0, x1, y0, y1 = self.bounds
+    def bounds_center(self, panel) -> tuple[float, float]:
+        x0, x1, y0, y1 = panel.bounds
         return 0.5 * (x0 + x1), 0.5 * (y0 + y1)
 
     def set_patch_centers(self, patches, x: float, y: float) -> None:
@@ -2380,15 +3144,8 @@ class InteractiveZoom:
 
     def current_extraction_signature(self) -> tuple:
         return (
-            str(self.eventfile),
-            round(self.src_x, 6),
-            round(self.src_y, 6),
-            round(self.src_radius, 6),
-            round(self.src_inner_radius, 6),
-            round(self.bkg_x, 6),
-            round(self.bkg_y, 6),
-            round(self.bkg_radius, 6),
-            round(self.bkg_inner_radius, 6),
+            self.src.key(),
+            self.bkg.key(),
             self.energy_filter,
             self.pha_min if self.energy_filter else None,
             self.pha_max if self.energy_filter else None,
@@ -2412,7 +3169,7 @@ class InteractiveZoom:
 
     def clear_extraction_state(self) -> None:
         self.next_extract = "lightcurve"
-        self.last_lightcurve_path = None
+        self.last_lightcurve_paths = {}
         self.last_lightcurve_signature = None
         self.clear_spectrum_state()
         self.region_changed_notice_shown = False
@@ -2424,25 +3181,24 @@ class InteractiveZoom:
     def warn_if_region_products_changed(self) -> None:
         if self.region_changed_notice_shown:
             return
-        if self.last_lightcurve_path is None and self.last_spectrum_products is None:
+        if not self.last_lightcurve_paths and self.last_spectrum_products is None:
             return
         self.warn("regions changed; previous LC/spectrum products no longer match current regions.")
         self.region_changed_notice_shown = True
 
-    def live_lc_extract_request(self) -> tuple[tuple, dict]:
-        signature = self.current_extraction_signature()
-        kwargs = {
-            "eventfile": self.eventfile,
-            "project_dir": self.project_dir,
-            "wcs": self.wcs,
-            "src_x": self.src_x,
-            "src_y": self.src_y,
-            "src_radius": self.src_radius,
-            "bkg_x": self.bkg_x,
-            "bkg_y": self.bkg_y,
-            "bkg_radius": self.bkg_radius,
-            "src_inner_radius": self.src_inner_radius,
-            "bkg_inner_radius": self.bkg_inner_radius,
+    def _lc_kwargs_for_panel(self, panel) -> dict:
+        return {
+            "eventfile": panel.eventfile,
+            "project_dir": panel.project_dir,
+            "wcs": panel.wcs,
+            "src_x": panel.src_x,
+            "src_y": panel.src_y,
+            "src_radius": panel.src_radius,
+            "bkg_x": panel.bkg_x,
+            "bkg_y": panel.bkg_y,
+            "bkg_radius": panel.bkg_radius,
+            "src_inner_radius": panel.src_inner_radius,
+            "bkg_inner_radius": panel.bkg_inner_radius,
             "lc_bin": self.lc_bin,
             "pha_min": self.pha_min,
             "pha_max": self.pha_max,
@@ -2451,35 +3207,31 @@ class InteractiveZoom:
             "module_name": self.module_name,
             "modules_init": self.modules_init,
         }
-        return signature, kwargs
+
+    def live_lc_extract_request(self) -> tuple[tuple, dict]:
+        # Live refresh (LIVE_LC_REFRESH, off by default) tracks the primary panel only.
+        return self.current_extraction_signature(), self._lc_kwargs_for_panel(self.primary)
 
     def _src_moved(self) -> bool:
-        return (
-            (self.src_x, self.src_y) != self.initial_src
-            or self.src_radius != self.initial_src_radius
-            or self.src_inner_radius != self.initial_src_inner_radius
-            or self.src_region_type != self.initial_src_region_type
-        )
+        return self.src.key() != self.initial_src_model.key()
 
     def _bkg_moved(self) -> bool:
-        return (
-            (self.bkg_x, self.bkg_y) != self.initial_bkg
-            or self.bkg_radius != self.initial_bkg_radius
-            or self.bkg_inner_radius != self.initial_bkg_inner_radius
-            or self.bkg_region_type != self.initial_bkg_region_type
-        )
+        return self.bkg.key() != self.initial_bkg_model.key()
 
     def update_legend_labels(self) -> None:
-        src_label = self.src_label_moved if self._src_moved() else self.src_label_original
-        bkg_label = self.bkg_label_moved if self._bkg_moved() else self.bkg_label_original
-        self.src_patches[1].set_label(src_label)
-        self.bkg_patches[1].set_label(bkg_label)
-        self.ax.legend(loc="upper left", frameon=False, labelcolor="white")
+        src_moved = self._src_moved()
+        bkg_moved = self._bkg_moved()
+        for panel in self.panels:
+            src_label = f"ds8-{panel.src_reg.name}" if src_moved else panel.src_reg.name
+            bkg_label = f"ds8-{panel.bkg_reg.name}" if bkg_moved else panel.bkg_reg.name
+            panel.src_patches[1].set_label(src_label)
+            panel.bkg_patches[1].set_label(bkg_label)
+            panel.ax.legend(loc="upper left", frameon=False, labelcolor="white")
 
     def on_region_changed(self, *, force_lc_refresh: bool = False) -> None:
         self.warn_if_region_products_changed()
         self.update_legend_labels()
-        if LIVE_LC_REFRESH and self.live_lc_enabled and self.last_lightcurve_path is not None:
+        if LIVE_LC_REFRESH and self.live_lc_enabled and self.last_lightcurve_paths:
             self.last_lightcurve_signature = None
             self.clear_spectrum_state()
             self.next_extract = "spectrum"
@@ -2536,7 +3288,7 @@ class InteractiveZoom:
             live_generation = generation == self.live_lc_generation
             pending_refresh = self.live_lc_pending
             if lc_path is not None and self.live_lc_enabled and live_generation:
-                self.last_lightcurve_path = lc_path
+                self.last_lightcurve_paths = {self.primary.detector: lc_path}
                 self.last_lightcurve_signature = signature
                 self.clear_spectrum_state()
                 self.next_extract = "spectrum"
@@ -2559,21 +3311,23 @@ class InteractiveZoom:
         terminal_warning(message, rows)
 
     def region_rows(self) -> tuple[tuple[str, str], tuple[str, str]]:
-        src_desc = f"x={self.src_x + 1:.3f}, y={self.src_y + 1:.3f}, r={self.src_radius:.3f}"
+        P = self.active_panel
+        src_desc = f"x={P.src_x + 1:.3f}, y={P.src_y + 1:.3f}, r={P.src_radius:.3f}"
         if self.src_region_type == "annulus":
-            src_desc += f", ir={self.src_inner_radius:.3f}"
-        bkg_desc = f"x={self.bkg_x + 1:.3f}, y={self.bkg_y + 1:.3f}, r={self.bkg_radius:.3f}"
+            src_desc += f", ir={P.src_inner_radius:.3f}"
+        bkg_desc = f"x={P.bkg_x + 1:.3f}, y={P.bkg_y + 1:.3f}, r={P.bkg_radius:.3f}"
         if self.bkg_region_type == "annulus":
-            bkg_desc += f", ir={self.bkg_inner_radius:.3f}"
+            bkg_desc += f", ir={P.bkg_inner_radius:.3f}"
         return (("src", src_desc), ("bkg", bkg_desc))
 
     def active_group(self) -> str | None:
         return self.selected_group or self.hover_group
 
     def centroid_source(self) -> None:
-        y_grid, x_grid = np.indices(self.counts.shape, dtype=float)
-        in_source = (x_grid - self.src_x) ** 2 + (y_grid - self.src_y) ** 2 <= self.src_radius**2
-        weights = np.asarray(self.counts, dtype=float)
+        P = self.active_panel
+        y_grid, x_grid = np.indices(P.counts.shape, dtype=float)
+        in_source = (x_grid - P.src_x) ** 2 + (y_grid - P.src_y) ** 2 <= P.src_radius**2
+        weights = np.asarray(P.counts, dtype=float)
         usable = in_source & np.isfinite(weights) & (weights > 0)
         if not np.any(usable):
             self.warn("centroid skipped: no positive source pixels")
@@ -2586,7 +3340,7 @@ class InteractiveZoom:
 
         new_x = float((x_grid[usable] * weights[usable]).sum() / total)
         new_y = float((y_grid[usable] * weights[usable]).sum() / total)
-        old_x, old_y = self.src_x, self.src_y
+        old_x, old_y = P.src_x, P.src_y
         self.set_source_center(new_x, new_y)
         self.selected_group = "src"
         self.hover_group = None
@@ -2595,20 +3349,22 @@ class InteractiveZoom:
         self.info(
             "centroid",
             (
-                ("source", f"({old_x + 1:.2f}, {old_y + 1:.2f}) -> ({self.src_x + 1:.2f}, {self.src_y + 1:.2f})"),
-                ("radius", f"{self.src_radius:.3f} px"),
+                ("detector", P.label),
+                ("source", f"({old_x + 1:.2f}, {old_y + 1:.2f}) -> ({P.src_x + 1:.2f}, {P.src_y + 1:.2f})"),
+                ("radius", f"{P.src_radius:.3f} px"),
             ),
             block=True,
         )
         self.fig.canvas.draw_idle()
 
     def auto_background(self) -> None:
-        sig = (self.src_x, self.src_y, self.src_radius)
+        P = self.active_panel
+        sig = (P.detector, P.src_x, P.src_y, P.src_radius)
         if not hasattr(self, "_bkg_candidates") or self._bkg_sig != sig:
-            bkg_radius = max(self.bkg_radius, 1.5 * self.src_radius)
+            bkg_radius = max(P.bkg_radius, 1.5 * P.src_radius)
             try:
                 self._bkg_candidates = auto_background_candidates(
-                    self.counts, self.src_x, self.src_y, self.src_radius, bkg_radius,
+                    P.counts, P.src_x, P.src_y, P.src_radius, bkg_radius,
                 )
             except ValueError as exc:
                 self.warn(f"auto-background failed: {exc}")
@@ -2631,55 +3387,80 @@ class InteractiveZoom:
         self.info(
             "auto background",
             (
-                ("bkg", f"({self.bkg_x + 1:.2f}, {self.bkg_y + 1:.2f})"),
+                ("bkg", f"({self.active_panel.bkg_x + 1:.2f}, {self.active_panel.bkg_y + 1:.2f})"),
                 ("candidate", f"{rank_str}, score {score:.2f}"),
             ),
             block=True,
         )
         self.fig.canvas.draw_idle()
 
+    def sync_panels(self) -> None:
+        """Re-project the shared sky model into every panel and refresh its visuals.
+        This is the single place that keeps the FK5-linked regions consistent across
+        detectors after any geometry edit."""
+        for panel in self.panels:
+            self._project_panel_geometry(panel)
+            self.set_patch_centers(panel.src_patches, panel.src_x, panel.src_y)
+            self.set_patch_radii(panel.src_patches, panel.src_radius)
+            self.set_patch_centers(panel.bkg_patches, panel.bkg_x, panel.bkg_y)
+            self.set_patch_radii(panel.bkg_patches, panel.bkg_radius)
+            panel.src_highlight.center = (panel.src_x, panel.src_y)
+            panel.src_highlight.radius = panel.src_radius
+            panel.bkg_highlight.center = (panel.bkg_x, panel.bkg_y)
+            panel.bkg_highlight.radius = panel.bkg_radius
+            self._update_inner_patches(panel, "src")
+            self._update_inner_patches(panel, "bkg")
+            self.update_source_coord_text(panel)
+            self.apply_bounds(panel)
+
     def set_source_center(self, x_center: float, y_center: float) -> None:
-        self.bounds = square_window_inside_frame(x_center, y_center, self.half_width, self.counts)
-        self.src_x, self.src_y = self.bounds_center()
-        self.set_patch_centers(self.src_patches, self.src_x, self.src_y)
-        self.src_highlight.center = (self.src_x, self.src_y)
-        self._update_inner_patches("src")
-        self.update_source_coord_text()
-        self.apply_bounds()
+        P = self.active_panel
+        bounds = square_window_inside_frame(x_center, y_center, P.half_width, P.counts)
+        cx, cy = 0.5 * (bounds[0] + bounds[1]), 0.5 * (bounds[2] + bounds[3])
+        self.src.update_center_from_pixels(P.wcs, cx, cy)
+        self.sync_panels()
 
     def set_background_center(self, x_center: float, y_center: float) -> None:
-        self.bkg_x, self.bkg_y = clamp_center(x_center, y_center, self.bkg_radius, self.counts)
-        self.set_patch_centers(self.bkg_patches, self.bkg_x, self.bkg_y)
-        self.bkg_highlight.center = (self.bkg_x, self.bkg_y)
-        self._update_inner_patches("bkg")
-        self.update_handles()
+        P = self.active_panel
+        bx, by = clamp_center(x_center, y_center, P.bkg_radius, P.counts)
+        self.bkg.update_center_from_pixels(P.wcs, bx, by)
+        self.sync_panels()
 
     def set_source_radius(self, radius: float) -> None:
-        max_radius = 0.45 * min(self.counts.shape)
-        self.src_radius = min(max(radius, 2.0), max_radius)
-        if self.src_region_type == "annulus" and self.src_inner_radius >= self.src_radius - 1:
-            self.src_inner_radius = max(1.0, self.src_radius * 0.5)
-        self.half_width = self.src_radius * self.initial_zoom_factor
-        self.src_x, self.src_y = clamp_center(self.src_x, self.src_y, self.src_radius, self.counts)
-        self.bounds = square_window_inside_frame(self.src_x, self.src_y, self.half_width, self.counts)
-        self.src_x, self.src_y = self.bounds_center()
-        self.set_patch_centers(self.src_patches, self.src_x, self.src_y)
-        self.set_patch_radii(self.src_patches, self.src_radius)
-        self.src_highlight.center = (self.src_x, self.src_y)
-        self.src_highlight.radius = self.src_radius
-        self._update_inner_patches("src")
-        self.update_source_coord_text()
-        self.apply_bounds()
+        P = self.active_panel
+        max_radius = 0.45 * min(P.counts.shape)
+        r = min(max(radius, 2.0), max_radius)
+        ir = P.src_inner_radius if self.src_region_type == "annulus" else 0.0
+        if self.src_region_type == "annulus" and ir >= r - 1:
+            ir = max(1.0, r * 0.5)
+        cx, cy = clamp_center(P.src_x, P.src_y, r, P.counts)
+        bounds = square_window_inside_frame(cx, cy, r * self.zoom_factor, P.counts)
+        cx, cy = 0.5 * (bounds[0] + bounds[1]), 0.5 * (bounds[2] + bounds[3])
+        self.src.update_from_pixels(P.wcs, cx, cy, r, ir)
+        self.sync_panels()
 
     def set_background_radius(self, radius: float) -> None:
-        max_radius = 0.45 * min(self.counts.shape)
-        self.bkg_radius = min(max(radius, 2.0), max_radius)
-        if self.bkg_region_type == "annulus" and self.bkg_inner_radius >= self.bkg_radius - 1:
-            self.bkg_inner_radius = max(1.0, self.bkg_radius * 0.5)
-        self.set_patch_radii(self.bkg_patches, self.bkg_radius)
-        self.bkg_highlight.radius = self.bkg_radius
-        self._update_inner_patches("bkg")
-        self.set_background_center(self.bkg_x, self.bkg_y)
+        P = self.active_panel
+        max_radius = 0.45 * min(P.counts.shape)
+        r = min(max(radius, 2.0), max_radius)
+        ir = P.bkg_inner_radius if self.bkg_region_type == "annulus" else 0.0
+        if self.bkg_region_type == "annulus" and ir >= r - 1:
+            ir = max(1.0, r * 0.5)
+        bx, by = clamp_center(P.bkg_x, P.bkg_y, r, P.counts)
+        self.bkg.update_from_pixels(P.wcs, bx, by, r, ir)
+        self.sync_panels()
+
+    def set_source_inner_radius(self, inner: float) -> None:
+        P = self.active_panel
+        ir = max(1.0, min(inner, P.src_radius - 1.0))
+        self.src.update_from_pixels(P.wcs, P.src_x, P.src_y, P.src_radius, ir)
+        self.sync_panels()
+
+    def set_background_inner_radius(self, inner: float) -> None:
+        P = self.active_panel
+        ir = max(1.0, min(inner, P.bkg_radius - 1.0))
+        self.bkg.update_from_pixels(P.wcs, P.bkg_x, P.bkg_y, P.bkg_radius, ir)
+        self.sync_panels()
 
     def set_center(self, x_center: float, y_center: float) -> None:
         self.set_source_center(x_center, y_center)
@@ -2687,38 +3468,46 @@ class InteractiveZoom:
     def event_to_figure_xy(self, event) -> tuple[float, float]:
         return tuple(self.fig.transFigure.inverted().transform((event.x, event.y)))
 
-    def event_to_data_xy(self, event) -> tuple[float, float]:
-        return tuple(self.ax.transData.inverted().transform((event.x, event.y)))
+    def panel_for_axes(self, ax) -> DetectorPanel | None:
+        for panel in self.panels:
+            if ax is panel.ax or ax is panel.inset:
+                return panel
+        return None
 
-    def _install_viewport_rendering(self) -> None:
+    def _install_viewport_rendering(self, panel) -> None:
         # DS9-style rendering: feed each AxesImage only the data inside the current
         # view (decimated to ~screen resolution when zoomed out), so the per-frame
         # resample cost scales with the viewport, not the full detector. Re-run on any
         # limit change -- pan / zoom / scroll / reset all go through set_xlim/set_ylim,
         # which emit the xlim_changed / ylim_changed callbacks.
-        self._viewport_images = {id(self.ax): self.image, id(self.inset): self.inset_image}
-        self._viewport_state: dict[int, tuple] = {}
-        for target_ax in (self.ax, self.inset):
+        for target_ax, image in ((panel.ax, panel.image), (panel.inset, panel.inset_image)):
+            self._viewport_images[id(target_ax)] = image
+            self._viewport_panel[id(target_ax)] = panel
             target_ax.callbacks.connect("xlim_changed", self._on_axes_view_changed)
             target_ax.callbacks.connect("ylim_changed", self._on_axes_view_changed)
         self.fig.canvas.mpl_connect("resize_event", self._on_canvas_resize)
-        self._render_viewport(self.ax, self.image)
-        self._render_viewport(self.inset, self.inset_image)
+        self._render_viewport(panel.ax, panel.image)
+        self._render_viewport(panel.inset, panel.inset_image)
 
     def _on_axes_view_changed(self, ax) -> None:
         image = self._viewport_images.get(id(ax))
-        if image is not None:
-            self._render_viewport(ax, image)
+        panel = self._viewport_panel.get(id(ax))
+        if image is not None and panel is not None:
+            self._render_viewport(ax, image, panel)
 
     def _on_canvas_resize(self, _event) -> None:
         # The decimation factor is tied to the axes pixel size, so re-evaluate it when
         # the window (and thus the bbox) changes; clear the cache to defeat the guard.
         self._viewport_state.clear()
-        self._render_viewport(self.ax, self.image)
-        self._render_viewport(self.inset, self.inset_image)
+        for panel in self.panels:
+            self._render_viewport(panel.ax, panel.image, panel)
+            self._render_viewport(panel.inset, panel.inset_image, panel)
 
-    def _render_viewport(self, ax, image) -> None:
-        ny, nx = self.masked_counts.shape
+    def _render_viewport(self, ax, image, panel=None) -> None:
+        if panel is None:
+            panel = self._viewport_panel.get(id(ax), self.primary)
+        masked_counts = panel.masked_counts
+        ny, nx = masked_counts.shape
         x0, x1 = sorted(ax.get_xlim())
         y0, y1 = sorted(ax.get_ylim())
         margin = 2
@@ -2737,47 +3526,49 @@ class InteractiveZoom:
         if self._viewport_state.get(id(ax)) == key:
             return  # unchanged (e.g. the paired x/y-lim callback) -> skip re-slicing
         self._viewport_state[id(ax)] = key
-        sub = self.masked_counts[row0:row1:step, col0:col1:step]
+        sub = masked_counts[row0:row1:step, col0:col1:step]
         n_rows, n_cols = sub.shape
         image.set_data(sub)
         image.set_extent(
             (col0 - 0.5, col0 - 0.5 + n_cols * step, row0 - 0.5, row0 - 0.5 + n_rows * step)
         )
 
-    def set_main_window(self, x_center: float, y_center: float, side: float) -> None:
-        x_min, x_max = -0.5, self.counts.shape[1] - 0.5
-        y_min, y_max = -0.5, self.counts.shape[0] - 0.5
+    def set_main_window(self, panel, x_center: float, y_center: float, side: float) -> None:
+        x_min, x_max = -0.5, panel.counts.shape[1] - 0.5
+        y_min, y_max = -0.5, panel.counts.shape[0] - 0.5
         max_side = min(x_max - x_min, y_max - y_min)
         side = min(max(side, 5.0), max_side)
         half = 0.5 * side
         x_center = min(max(x_center, x_min + half), x_max - half)
         y_center = min(max(y_center, y_min + half), y_max - half)
-        self.ax.set_xlim(x_center - half, x_center + half)
-        self.ax.set_ylim(y_center - half, y_center + half)
-        self.ax.set_aspect("equal")
-        self.ax.set_box_aspect(1)
-        self.update_handles()
+        panel.ax.set_xlim(x_center - half, x_center + half)
+        panel.ax.set_ylim(y_center - half, y_center + half)
+        panel.ax.set_aspect("equal")
+        panel.ax.set_box_aspect(1)
+        self.update_handles(panel)
 
-    def set_inset_upper_right(self, x_right: float, y_top: float) -> None:
-        bbox = self.inset.get_position()
+    def set_inset_upper_right(self, panel, x_right: float, y_top: float) -> None:
+        bbox = panel.inset.get_position()
         margin = 0.015
         x0 = min(max(x_right - bbox.width, margin), 1.0 - margin - bbox.width)
         y0 = min(max(y_top - bbox.height, margin), 1.0 - margin - bbox.height)
-        self.inset.set_position([x0, y0, bbox.width, bbox.height])
-        self.place_inset_handle()
-        self.update_connectors()
+        panel.inset.set_position([x0, y0, bbox.width, bbox.height])
+        self.place_inset_handle(panel)
+        self.update_connectors(panel)
 
-    def apply_bounds(self) -> None:
-        x0, x1, y0, y1 = self.bounds
-        self.inset.set_xlim(x0, x1)
-        self.inset.set_ylim(y0, y1)
-        self.update_connectors()
-        self.update_handles()
-        self.update_highlights()
+    def apply_bounds(self, panel) -> None:
+        x0, x1, y0, y1 = panel.bounds
+        panel.inset.set_xlim(x0, x1)
+        panel.inset.set_ylim(y0, y1)
+        self.update_connectors(panel)
+        self.update_handles(panel)
+        self._apply_highlights(panel)
         self.update_status_labels()
 
     def gti_spectra_dir(self) -> Path:
-        return self.extraction_root() / NAMES.spec_workdir_name(self.eventfile) / "gti_spectra"
+        if self.dual:
+            return dual_gti_dir(self.extraction_root())
+        return self.extraction_root() / NAMES.spec_workdir_name(self.primary.eventfile) / "gti_spectra"
 
     def _refresh_gti_status(self) -> None:
         # GTI spectra are produced by the separate light-curve window process, so detect
@@ -2828,7 +3619,7 @@ class InteractiveZoom:
             renderer = self.fig.canvas.get_renderer()
         except Exception:
             return
-        title_bbox = self.ax.title.get_window_extent(renderer)
+        title_bbox = self.primary.ax.title.get_window_extent(renderer)
         cursor_x = title_bbox.x1 + 6
         title_cy = 0.5 * (title_bbox.y0 + title_bbox.y1)
         inv = self.fig.transFigure.inverted()
@@ -2861,40 +3652,56 @@ class InteractiveZoom:
             self.fig.canvas.draw_idle()
         return True
 
+    def panel_for_main_axes(self, event) -> DetectorPanel | None:
+        for panel in self.panels:
+            if event.inaxes is panel.ax:
+                return panel
+        return None
+
     def pick_target(self, event) -> str | None:
-        if self.inset_move_handle is not None:
-            contains, _ = self.inset_move_handle.contains(event)
-            if contains:
-                return "inset_move"
-        if event.inaxes is not self.ax or event.xdata is None or event.ydata is None:
+        # Inset move handles are figure-level artists that may lie outside any axes.
+        for panel in self.panels:
+            if panel.inset_move_handle is not None:
+                contains, _ = panel.inset_move_handle.contains(event)
+                if contains:
+                    self.active_panel = panel
+                    return "inset_move"
+        panel = self.panel_for_main_axes(event)
+        if panel is None or event.xdata is None or event.ydata is None:
             return None
+        self.active_panel = panel
         handle_names = ["src_resize", "src_move", "bkg_resize", "bkg_move"]
         if self.src_region_type == "annulus":
             handle_names.insert(0, "src_inner_resize")
         if self.bkg_region_type == "annulus":
             handle_names.append("bkg_inner_resize")
         for name in handle_names:
-            contains, _ = self.handles[name].contains(event)
+            contains, _ = panel.handles[name].contains(event)
             if contains:
                 return name
         if self.drag_region_body:
-            if self._region_body_contains("src", event.xdata, event.ydata):
+            if self._region_body_contains(panel, "src", event.xdata, event.ydata):
                 return "src_move"
-            if self._region_body_contains("bkg", event.xdata, event.ydata):
+            if self._region_body_contains(panel, "bkg", event.xdata, event.ydata):
                 return "bkg_move"
         return None
 
-    def update_connectors(self) -> None:
-        for line in self.connectors:
+    def update_connectors(self, panel) -> None:
+        for line in panel.connectors:
             line.remove()
-        self.connectors.clear()
+        panel.connectors.clear()
 
     def start_main_pan(self, event) -> None:
+        panel = self.panel_for_main_axes(event)
+        if panel is None:
+            return
+        self.active_panel = panel
+        self.pan_panel = panel
         self.dragging = True
         self.drag_target = "main_pan"
         self.pan_start_px = (float(event.x), float(event.y))
-        self.pan_xlim = tuple(self.ax.get_xlim())
-        self.pan_ylim = tuple(self.ax.get_ylim())
+        self.pan_xlim = tuple(panel.ax.get_xlim())
+        self.pan_ylim = tuple(panel.ax.get_ylim())
         self.selected_group = None
         self.hover_group = None
         self.update_highlights()
@@ -2903,33 +3710,32 @@ class InteractiveZoom:
     def on_press(self, event) -> None:
         if any(button.contains(event) for button in self.overlay_buttons):
             return  # handled by the button's own click callback
-        if event.inaxes is self.ax and event.button in (2, 3):
+        panel = self.panel_for_main_axes(event)
+        if panel is not None and event.button in (2, 3):
             self.start_main_pan(event)
             return
         if event.button != 1:
             return
         target = self.pick_target(event)
         if target is None:
-            if event.inaxes is self.ax:
+            if panel is not None:
                 self.start_main_pan(event)
                 return
             self.selected_group = None
             self.update_highlights()
             self.fig.canvas.draw_idle()
             return
+        P = self.active_panel
         if target == "inset_move":
             x_fig, y_fig = self.event_to_figure_xy(event)
-            bbox = self.inset.get_position()
+            bbox = P.inset.get_position()
             self.drag_offset = (x_fig - bbox.x1, y_fig - bbox.y1)
         elif target == "bkg_move":
-            x_center, y_center = self.bkg_x, self.bkg_y
-            self.drag_offset = (event.xdata - x_center, event.ydata - y_center)
+            self.drag_offset = (event.xdata - P.bkg_x, event.ydata - P.bkg_y)
         elif target == "src_move":
-            x_center, y_center = self.src_x, self.src_y
-            self.drag_offset = (event.xdata - x_center, event.ydata - y_center)
+            self.drag_offset = (event.xdata - P.src_x, event.ydata - P.src_y)
         else:
-            x_center, y_center = event.xdata, event.ydata
-            self.drag_offset = (event.xdata - x_center, event.ydata - y_center)
+            self.drag_offset = (0.0, 0.0)
         self.dragging = True
         self.drag_target = target
         self.selected_group = self.handle_group(target)
@@ -2944,22 +3750,24 @@ class InteractiveZoom:
             self.fig.canvas.draw_idle()
             return
         if self.drag_target == "main_pan":
+            P = self.pan_panel
             x0, x1 = self.pan_xlim
             y0, y1 = self.pan_ylim
             side = max(abs(x1 - x0), abs(y1 - y0))
-            width_px = max(float(self.ax.bbox.width), 1.0)
-            height_px = max(float(self.ax.bbox.height), 1.0)
+            width_px = max(float(P.ax.bbox.width), 1.0)
+            height_px = max(float(P.ax.bbox.height), 1.0)
             dx = (float(event.x) - self.pan_start_px[0]) * abs(x1 - x0) / width_px
             dy = (float(event.y) - self.pan_start_px[1]) * abs(y1 - y0) / height_px
-            self.set_main_window(0.5 * (x0 + x1) - dx, 0.5 * (y0 + y1) - dy, side)
+            self.set_main_window(P, 0.5 * (x0 + x1) - dx, 0.5 * (y0 + y1) - dy, side)
             self.fig.canvas.draw_idle()
             return
+        P = self.active_panel
         if self.drag_target == "inset_move":
             x_fig, y_fig = self.event_to_figure_xy(event)
-            self.set_inset_upper_right(x_fig - self.drag_offset[0], y_fig - self.drag_offset[1])
+            self.set_inset_upper_right(P, x_fig - self.drag_offset[0], y_fig - self.drag_offset[1])
             self.fig.canvas.draw_idle()
             return
-        if event.inaxes is not self.ax or event.xdata is None or event.ydata is None:
+        if event.inaxes is not P.ax or event.xdata is None or event.ydata is None:
             return
         x_center = event.xdata - self.drag_offset[0]
         y_center = event.ydata - self.drag_offset[1]
@@ -2971,35 +3779,31 @@ class InteractiveZoom:
             self.set_source_center(x_center, y_center)
             region_changed = True
         elif self.drag_target == "src_resize":
-            self.set_source_radius(max(abs(event.xdata - self.src_x), abs(event.ydata - self.src_y)))
+            self.set_source_radius(max(abs(event.xdata - P.src_x), abs(event.ydata - P.src_y)))
             region_changed = True
         elif self.drag_target == "bkg_resize":
-            self.set_background_radius(max(abs(event.xdata - self.bkg_x), abs(event.ydata - self.bkg_y)))
+            self.set_background_radius(max(abs(event.xdata - P.bkg_x), abs(event.ydata - P.bkg_y)))
             region_changed = True
         elif self.drag_target == "src_inner_resize":
-            dist = math.hypot(event.xdata - self.src_x, event.ydata - self.src_y)
-            self.src_inner_radius = max(1.0, min(dist, self.src_radius - 1.0))
-            self._update_inner_patches("src")
-            self.update_handles()
+            self.set_source_inner_radius(math.hypot(event.xdata - P.src_x, event.ydata - P.src_y))
             region_changed = True
         elif self.drag_target == "bkg_inner_resize":
-            dist = math.hypot(event.xdata - self.bkg_x, event.ydata - self.bkg_y)
-            self.bkg_inner_radius = max(1.0, min(dist, self.bkg_radius - 1.0))
-            self._update_inner_patches("bkg")
-            self.update_handles()
+            self.set_background_inner_radius(math.hypot(event.xdata - P.bkg_x, event.ydata - P.bkg_y))
             region_changed = True
         if region_changed:
             self.on_region_changed()
         self.fig.canvas.draw_idle()
 
     def on_scroll(self, event) -> None:
-        if event.inaxes is not self.ax:
+        panel = self.panel_for_main_axes(event)
+        if panel is None:
             return
-        x0, x1 = self.ax.get_xlim()
-        y0, y1 = self.ax.get_ylim()
+        self.active_panel = panel
+        x0, x1 = panel.ax.get_xlim()
+        y0, y1 = panel.ax.get_ylim()
         current_side = max(abs(x1 - x0), abs(y1 - y0))
         scale = 1.0 / 1.2 if event.button == "up" else 1.2
-        self.set_main_window(0.5 * (x0 + x1), 0.5 * (y0 + y1), current_side * scale)
+        self.set_main_window(panel, 0.5 * (x0 + x1), 0.5 * (y0 + y1), current_side * scale)
         self.fig.canvas.draw_idle()
 
     def on_release(self, event) -> None:  # noqa: ARG002
@@ -3024,23 +3828,22 @@ class InteractiveZoom:
         elif event.key == "q":
             plt.close(self.fig)
         elif event.key == "r":
-            self.ax.set_xlim(*self.initial_main_xlim)
-            self.ax.set_ylim(*self.initial_main_ylim)
-            self.inset.set_position(self.initial_inset_position)
-            self.set_source_radius(self.initial_src_radius)
-            self.set_background_radius(self.initial_bkg_radius)
-            self.half_width = self.src_radius * self.initial_zoom_factor
-            self.set_background_center(*self.initial_bkg)
-            self.set_source_center(*self.initial_src)
-            self.src_inner_radius = self.initial_src_inner_radius
-            self.bkg_inner_radius = self.initial_bkg_inner_radius
+            self.toggle_reference_visibility()
+        elif event.key in {"R", "shift+r", "home"}:
+            for panel in self.panels:
+                panel.ax.set_xlim(*panel.initial_main_xlim)
+                panel.ax.set_ylim(*panel.initial_main_ylim)
+                panel.inset.set_position(panel.initial_inset_position)
+            self.src = self.initial_src_model.copy()
+            self.bkg = self.initial_bkg_model.copy()
             self.src_region_type = self.initial_src_region_type
             self.bkg_region_type = self.initial_bkg_region_type
-            self._update_inner_patches("src")
-            self._update_inner_patches("bkg")
+            self.src.region_type = self.src_region_type
+            self.bkg.region_type = self.bkg_region_type
             self.selected_group = None
             self.hover_group = None
             self.clear_extraction_state()
+            self.sync_panels()
             self.update_legend_labels()
             self.update_highlights()
             self.fig.canvas.draw_idle()
@@ -3053,7 +3856,7 @@ class InteractiveZoom:
             if self.active_group() == "src":
                 self.centroid_source()
             elif self.active_group() == "bkg":
-                self.set_background_center(self.src_x, self.src_y)
+                self.set_background_center(self.active_panel.src_x, self.active_panel.src_y)
                 self.on_region_changed(force_lc_refresh=True)
                 self.fig.canvas.draw_idle()
             else:
@@ -3074,34 +3877,64 @@ class InteractiveZoom:
         elif event.key == "z":
             self.toggle_inset_visibility()
 
+    def toggle_reference_visibility(self) -> None:
+        self.reference_visible = not self.reference_visible
+        for panel in self.panels:
+            for artist in panel.reference_artists:
+                artist.set_visible(self.reference_visible)
+        self.fig.canvas.draw_idle()
+
     def toggle_inset_visibility(self) -> None:
-        visible = not self.inset.get_visible()
-        self.inset.set_visible(visible)
-        if self.inset_move_handle is not None:
-            self.inset_move_handle.set_visible(visible)
-        self.inset_rect.set_visible(visible)
+        visible = not self.primary.inset.get_visible()
+        for panel in self.panels:
+            panel.inset.set_visible(visible)
+            if panel.inset_move_handle is not None:
+                panel.inset_move_handle.set_visible(visible)
+            if panel.inset_rect is not None:
+                panel.inset_rect.set_visible(visible)
         self.fig.canvas.draw_idle()
 
     def cycle_region_type(self, group: str) -> None:
+        P = self.active_panel
         cur = self.src_region_type if group == "src" else self.bkg_region_type
         idx = (self.REGION_TYPES.index(cur) + 1) % len(self.REGION_TYPES)
         new_type = self.REGION_TYPES[idx]
         if group == "src":
             self.src_region_type = new_type
-            if new_type == "annulus" and self.src_inner_radius <= 0:
-                self.src_inner_radius = 0.5 * self.src_radius
+            self.src.region_type = new_type
+            if new_type == "annulus" and P.src_inner_radius <= 0:
+                self.src.update_from_pixels(P.wcs, P.src_x, P.src_y, P.src_radius, 0.5 * P.src_radius)
             elif new_type == "circle":
-                self.src_inner_radius = 0.0
+                self.src.inner_radius = 0.0
         else:
             self.bkg_region_type = new_type
-            if new_type == "annulus" and self.bkg_inner_radius <= 0:
-                self.bkg_inner_radius = 0.5 * self.bkg_radius
+            self.bkg.region_type = new_type
+            if new_type == "annulus" and P.bkg_inner_radius <= 0:
+                self.bkg.update_from_pixels(P.wcs, P.bkg_x, P.bkg_y, P.bkg_radius, 0.5 * P.bkg_radius)
             elif new_type == "circle":
-                self.bkg_inner_radius = 0.0
-        self._update_inner_patches(group)
-        self.update_handles()
+                self.bkg.inner_radius = 0.0
+        self.sync_panels()
         self.on_region_changed()
         self.fig.canvas.draw_idle()
+
+    def _run_over_panels(self, work) -> tuple[dict, dict]:
+        """Run ``work(panel)`` for every panel in parallel threads and collect
+        ``{detector: result}`` and ``{detector: exception}`` maps."""
+        results: dict[str, object] = {}
+        errors: dict[str, Exception] = {}
+
+        def run(panel):
+            try:
+                results[panel.detector] = work(panel)
+            except Exception as exc:  # noqa: BLE001 -- reported per detector below
+                errors[panel.detector] = exc
+
+        threads = [threading.Thread(target=run, args=(panel,)) for panel in self.panels]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return results, errors
 
     def extract_and_plot(self) -> None:
         self.info("LC extraction", (("status", "running"), *self.region_rows()), block=True)
@@ -3110,35 +3943,19 @@ class InteractiveZoom:
         self.lc_running = True
         self.update_status_labels()
         self._flush_draw()
-        try:
-            lc_path = extract_lightcurve_with_heasoft(
-                eventfile=self.eventfile,
-                project_dir=self.project_dir,
-                wcs=self.wcs,
-                src_x=self.src_x,
-                src_y=self.src_y,
-                src_radius=self.src_radius,
-                bkg_x=self.bkg_x,
-                bkg_y=self.bkg_y,
-                bkg_radius=self.bkg_radius,
-                src_inner_radius=self.src_inner_radius,
-                bkg_inner_radius=self.bkg_inner_radius,
-                lc_bin=self.lc_bin,
-                pha_min=self.pha_min,
-                pha_max=self.pha_max,
-                energy_filter=self.energy_filter,
-                extract_dir=self.extract_dir,
-                module_name=self.module_name,
-                modules_init=self.modules_init,
-            )
-        except Exception as exc:
+
+        results, errors = self._run_over_panels(
+            lambda panel: extract_lightcurve_with_heasoft(**self._lc_kwargs_for_panel(panel))
+        )
+        if errors:
             self.lc_running = False
             self.update_status_labels()
             self.fig.canvas.draw_idle()
-            self.warn("LC extraction failed", (("elapsed", f"{time.monotonic() - started:.1f}s"), ("detail", exc)))
+            detail = "; ".join(f"{det}: {exc}" for det, exc in errors.items())
+            self.warn("LC extraction failed", (("elapsed", f"{time.monotonic() - started:.1f}s"), ("detail", detail)))
             return
 
-        self.last_lightcurve_path = lc_path
+        self.last_lightcurve_paths = results
         self.last_lightcurve_signature = signature
         self.lc_running = False
         self.lc_status_sig = signature
@@ -3152,7 +3969,7 @@ class InteractiveZoom:
         self.next_extract = "spectrum"
         if LIVE_LC_REFRESH:
             try:
-                write_lc_watch_file(self.ensure_lc_watch_path(), lc_path)
+                write_lc_watch_file(self.ensure_lc_watch_path(), results[self.primary.detector])
                 with self.live_lc_lock:
                     self.live_lc_enabled = True
                     self.live_lc_pending = False
@@ -3164,12 +3981,12 @@ class InteractiveZoom:
             "LC ready",
             (
                 ("elapsed", f"{time.monotonic() - started:.1f}s"),
-                ("file", lc_path),
+                *((panel.label, str(results[panel.detector])) for panel in self.panels),
                 ("next", "press e for spectrum"),
             ),
             block=True,
         )
-        self.launch_lightcurve_window(lc_path)
+        self.launch_lightcurve_window(results)
 
     def active_lightcurve_processes(self) -> list[subprocess.Popen]:
         self.lightcurve_processes = [process for process in self.lightcurve_processes if process.poll() is None]
@@ -3181,42 +3998,27 @@ class InteractiveZoom:
     def reopen_lightcurve_window_if_needed(self) -> bool:
         signature = self.current_extraction_signature()
         if (
-            self.last_lightcurve_path is None
+            not self.last_lightcurve_paths
             or self.last_lightcurve_signature != signature
-            or not self.last_lightcurve_path.is_file()
+            or any(not Path(p).is_file() for p in self.last_lightcurve_paths.values())
         ):
             return False
         if self.lightcurve_window_is_open():
             return False
         try:
-            write_lc_watch_file(self.ensure_lc_watch_path(), self.last_lightcurve_path)
+            write_lc_watch_file(self.ensure_lc_watch_path(), self.last_lightcurve_paths[self.primary.detector])
         except Exception as exc:
             self.warn(f"could not refresh light-curve watch file: {exc}")
         self.info(
             "LC window",
             (
                 ("status", "reopening"),
-                ("file", self.last_lightcurve_path),
                 ("next", "press e again for spectrum"),
             ),
             block=True,
         )
-        self.launch_lightcurve_window(self.last_lightcurve_path)
+        self.launch_lightcurve_window(self.last_lightcurve_paths)
         return True
-
-    def run_grppha(self, src_pha: Path, min_counts: int) -> Path:
-        out = src_pha.with_name(f"{src_pha.stem}-g{min_counts}{src_pha.suffix}")
-        result = run_heasoft_command(
-            ["grppha", str(src_pha), f"!{out}", f"comm=group min {min_counts} & exit", "chatter=5"],
-            cwd=src_pha.parent,
-            stdin_text="",
-            module_name=self.module_name,
-            modules_init=self.modules_init,
-        )
-        require_success(result, "grppha")
-        if not out.is_file():
-            raise RuntimeError(f"grppha completed but output not found: {out}")
-        return out
 
     def extract_spectrum_and_report(self) -> None:
         if self.reopen_lightcurve_window_if_needed():
@@ -3224,7 +4026,7 @@ class InteractiveZoom:
         self.info("spectrum extraction", (("status", "running"), *self.region_rows()), block=True)
         started = time.monotonic()
         signature = self.current_extraction_signature()
-        if self.last_lightcurve_path is None or self.last_lightcurve_signature != signature:
+        if not self.last_lightcurve_paths or self.last_lightcurve_signature != signature:
             with self.live_lc_lock:
                 live_refresh_running = self.live_lc_inflight
             if live_refresh_running:
@@ -3235,42 +4037,47 @@ class InteractiveZoom:
         self.spec_running = True
         self.update_status_labels()
         self._flush_draw()
-        try:
+
+        def work(panel):
             mkf_file = None
             if RESPONSE_FILES_MODE != "existing":
-                mkf_file = self.mkf_file or resolve_mkf_file(None, self.project_dir, self.eventfile)
-            products = extract_spectrum_with_heasoft(
-                eventfile=self.eventfile,
-                project_dir=self.project_dir,
+                mkf_file = panel.mkf_file or resolve_mkf_file(None, panel.project_dir, panel.eventfile)
+            return extract_spectrum_with_heasoft(
+                eventfile=panel.eventfile,
+                project_dir=panel.project_dir,
                 mkf_file=mkf_file,
-                wcs=self.wcs,
-                src_x=self.src_x,
-                src_y=self.src_y,
-                src_radius=self.src_radius,
-                bkg_x=self.bkg_x,
-                bkg_y=self.bkg_y,
-                bkg_radius=self.bkg_radius,
-                src_inner_radius=self.src_inner_radius,
-                bkg_inner_radius=self.bkg_inner_radius,
+                wcs=panel.wcs,
+                src_x=panel.src_x,
+                src_y=panel.src_y,
+                src_radius=panel.src_radius,
+                bkg_x=panel.bkg_x,
+                bkg_y=panel.bkg_y,
+                bkg_radius=panel.bkg_radius,
+                src_inner_radius=panel.src_inner_radius,
+                bkg_inner_radius=panel.bkg_inner_radius,
                 extract_dir=self.extract_dir,
                 psfcor=self.psfcor,
                 module_name=self.module_name,
                 modules_init=self.modules_init,
             )
-        except Exception as exc:
+
+        products_map, errors = self._run_over_panels(work)
+        if errors:
             self.spec_running = False
             self.update_status_labels()
             self.fig.canvas.draw_idle()
-            self.warn("spectrum extraction failed", (("elapsed", f"{time.monotonic() - started:.1f}s"), ("detail", exc)))
+            detail = "; ".join(f"{det}: {exc}" for det, exc in errors.items())
+            self.warn("spectrum extraction failed", (("elapsed", f"{time.monotonic() - started:.1f}s"), ("detail", detail)))
             return
 
-        for mc in (3, 20):
-            try:
-                self.run_grppha(products["src_pha"], mc)
-            except Exception as exc:
-                self.warn(f"grppha rebin {mc} failed", (("detail", exc),))
+        for det, products in products_map.items():
+            for mc in (3, 20):
+                try:
+                    run_grppha(products["src_pha"], mc, self.module_name, self.modules_init)
+                except Exception as exc:
+                    self.warn(f"grppha rebin {mc} failed ({det})", (("detail", exc),))
 
-        self.last_spectrum_products = products
+        self.last_spectrum_products = products_map
         self.last_spectrum_signature = signature
         self.spec_running = False
         self.spec_status_sig = signature
@@ -3281,24 +4088,25 @@ class InteractiveZoom:
             "spectrum ready",
             (
                 ("elapsed", f"{time.monotonic() - started:.1f}s"),
-                ("workdir", products["workdir"]),
+                *((panel.label, str(products_map[panel.detector]["workdir"])) for panel in self.panels),
                 ("next", "press x to open XSPEC"),
             ),
             block=True,
         )
 
-    def launch_lightcurve_window(self, lc_path: Path) -> None:
+    def launch_lightcurve_window(self, lc_paths: dict) -> None:
         # A (re)extraction replaces the previous LC window: close any open one first so
         # the new window supersedes it instead of stacking up.
         if self.lightcurve_processes:
             self.terminate_processes(self.lightcurve_processes)
             self.lightcurve_processes = []
-        title = f"{self.eventfile.name} corrected light curve"
+        primary = self.primary
+        title = f"{primary.label} corrected light curve"
         command = [
             sys.executable,
             str(Path(__file__).resolve()),
             "--plot-lc",
-            str(lc_path),
+            str(lc_paths[primary.detector]),
             "--plot-title",
             title,
             "--lc-bin",
@@ -3311,18 +4119,33 @@ class InteractiveZoom:
             "--modules-init",
             self.modules_init,
             "--lc-eventfile",
-            str(self.eventfile),
+            str(primary.eventfile),
             "--lc-project-dir",
-            str(self.project_dir),
+            str(primary.project_dir),
             "--psfcor",
             f"{self.psfcor:g}",
         ]
         if RESPONSE_FILES_MODE != "existing":
             try:
-                mkf_file = self.mkf_file or resolve_mkf_file(None, self.project_dir, self.eventfile)
+                mkf_file = primary.mkf_file or resolve_mkf_file(None, primary.project_dir, primary.eventfile)
                 command.extend(["--lc-mkf", str(mkf_file)])
             except Exception:
                 pass
+        if self.dual:
+            secondary = self.panels[1]
+            command.extend([
+                "--dual-lc",
+                "--plot-lc-b", str(lc_paths[secondary.detector]),
+                "--plot-title-b", f"{secondary.label} corrected light curve",
+                "--lc-eventfile-b", str(secondary.eventfile),
+                "--lc-project-dir-b", str(secondary.project_dir),
+            ])
+            if RESPONSE_FILES_MODE != "existing":
+                try:
+                    mkf_b = secondary.mkf_file or resolve_mkf_file(None, secondary.project_dir, secondary.eventfile)
+                    command.extend(["--lc-mkf-b", str(mkf_b)])
+                except Exception:
+                    pass
         if self.live_lc_enabled and self.lc_watch_path is not None:
             command.extend(["--watch-lc", str(self.lc_watch_path)])
         env = os.environ.copy()
@@ -3378,15 +4201,24 @@ class InteractiveZoom:
     def on_close(self, event) -> None:  # noqa: ARG002
         self.close_child_windows()
 
+    def _assemble_dual_spec_dir(self) -> Path:
+        """Collect both detectors' stem-named spectrum products into one directory so
+        xspec_init loads them as slots 1 and 2 (data 1:1 fxta, data 2:2 fxtb) via the
+        config's [xspec].datasets = ["a", "b"]."""
+        return assemble_spectrum_products_for_xspec(
+            self.extraction_root() / "ds8-dual-spec",
+            self.last_spectrum_products,
+        )
+
     def open_xspec_for_current_spectrum(self) -> None:
         signature = self.current_extraction_signature()
-        if self.last_lightcurve_path is None or not self.last_lightcurve_path.is_file():
+        if not self.last_lightcurve_paths or any(not Path(p).is_file() for p in self.last_lightcurve_paths.values()):
             self.warn("no current light curve is available; press e to extract the light curve first.")
             return
         if self.last_lightcurve_signature != signature:
             self.warn("the current regions no longer match the generated light curve; press e to regenerate products.")
             return
-        if self.last_spectrum_products is None:
+        if not self.last_spectrum_products:
             self.warn("no spectrum products are available for the current light curve; press e again to extract spectrum.")
             return
         if self.last_spectrum_signature != self.last_lightcurve_signature:
@@ -3394,131 +4226,167 @@ class InteractiveZoom:
             return
 
         required = ("src_pha", "bkg_pha", "rmf", "arf")
-        missing = [key for key in required if not self.last_spectrum_products[key].is_file()]
-        if missing:
-            names = ", ".join(missing)
-            self.warn(f"spectrum products are missing ({names}); press e again to regenerate spectrum.")
-            return
-
-        helper = Path(__file__).resolve().with_name("xspec_init")
-        command = [str(helper) if helper.is_file() else "xspec_init"]
-        command.extend(
-            [
-                str(self.last_spectrum_products["workdir"]),
-                "--data",
-                str(self.last_spectrum_products["src_pha"]),
-                "--background",
-                str(self.last_spectrum_products["bkg_pha"]),
-                "--rmf",
-                str(self.last_spectrum_products["rmf"]),
-                "--arf",
-                str(self.last_spectrum_products["arf"]),
-                "-r",
-                "3",
-            ]
-        )
-        if SOURCE_ID is not None:
-            command.extend(["--source", str(SOURCE_ID)])
-        if CONFIG_PATH:
-            command.extend(["--config", CONFIG_PATH])
-        self.info("XSPEC", (("status", "opening"), ("workdir", self.last_spectrum_products["workdir"])), block=True)
-        shell_parts: list[str] = []
-        if HEASOFT_MODE == "module":
-            init = Path(self.modules_init).expanduser()
-            if not init.is_file():
-                self.warn(f"--heasoft-mode=module but the Environment Modules init file was not found: {init}")
+        for det, products in self.last_spectrum_products.items():
+            missing = [key for key in required if not products[key].is_file()]
+            if missing:
+                names = ", ".join(missing)
+                self.warn(f"spectrum products are missing for {det} ({names}); press e again to regenerate spectrum.")
                 return
-            shell_parts.extend(
-                [
-                    f". {shlex.quote(str(init))}",
-                    f"module load {shlex.quote(self.module_name)}",
-                ]
-            )
-        elif not os.environ.get("HEADAS"):
-            self.warn("$HEADAS is not set; cannot launch XSPEC in headas mode. Source your fxtsoft headas-init.sh, or set mode=module.")
-            return
-        shell_parts.append(f"exec {shlex.join(command)}")
-        suspend_terminal_hints()
+
+        command, workdir = xspec_command_for_products(
+            self.last_spectrum_products,
+            dual_workdir=self.extraction_root() / "ds8-dual-spec",
+        )
+        self.info("XSPEC", (("status", "opening"), ("workdir", workdir)), block=True)
         try:
-            process = subprocess.Popen(
-                ["bash", "-lc", "; ".join(shell_parts)],
-                cwd=self.last_spectrum_products["workdir"],
-                close_fds=True,
-                start_new_session=True,
+            process = launch_xspec_command(
+                command,
+                workdir=workdir,
+                module_name=self.module_name,
+                modules_init=self.modules_init,
             )
         except Exception as exc:
-            resume_terminal_hints()
             self.warn(f"could not launch xspec_init: {exc}")
             return
         self.xspec_processes.append(process)
         self.xspec_processes = [item for item in self.xspec_processes if item.poll() is None]
 
-        def resume_after_xspec() -> None:
-            process.wait()
-            resume_terminal_hints()
 
-        threading.Thread(target=resume_after_xspec, daemon=True).start()
+def resolve_event_files(path_arg: str, detector: str | None) -> tuple[list[tuple[str, Path]], Path]:
+    """Return ``([(detector, eventfile), ...], project_dir)``.
+
+    When PATH is a directory, ``--detector`` is unset/``auto``, and more than one
+    configured detector each match exactly one event file, return them all (the
+    parallel A/B view). Otherwise return a single event file (the classic view).
+    """
+    path = Path(path_arg).expanduser().resolve()
+    if path.is_file():
+        det = NAMES.detector_for_event(path) or ""
+        return [(det, path)], path.parent
+    if not path.is_dir():
+        raise FileNotFoundError(f"Path not found: {path}")
+    if detector and detector.lower() != "auto":
+        eventfile, project_dir = resolve_event_file(path_arg, detector)
+        return [(detector, eventfile)], project_dir
+
+    found: list[tuple[str, Path]] = []
+    for det in NAMES.detector_ids():
+        matches = sorted(path.glob(NAMES.event_pattern(det)))
+        if len(matches) == 1:
+            found.append((det, matches[0]))
+        elif len(matches) > 1:
+            names = ", ".join(match.name for match in matches)
+            raise RuntimeError(f"Ambiguous {NAMES.detector_label(det)} event file; matched: {names}")
+    if not found:
+        # Reuse the single-file resolver's error handling for the no-match case.
+        eventfile, project_dir = resolve_event_file(path_arg, detector)
+        return [(NAMES.detector_for_event(eventfile) or "", eventfile)], project_dir
+    return found, path
 
 
-def build_viewer(args: argparse.Namespace):
-    eventfile, project_dir = resolve_event_file(args.path, args.detector)
-    src_reg = resolve_region(args.src_reg, project_dir)
-    bkg_reg = resolve_region(args.bkg_reg, project_dir)
-    output = Path(args.output).expanduser().resolve() if args.output else default_output_path(eventfile, project_dir)
-    mkf_file = resolve_optional_mkf(args.mkf, project_dir)
-    if mkf_file is not None and not mkf_file.is_file():
-        raise FileNotFoundError(f"MKF file not found: {mkf_file}")
-
-    frame = load_frame(eventfile, "EVENTS", "X", "Y", spatial_bin=args.spatial_bin)
-    ny, nx = frame.counts.shape
-    counts = frame.counts
-    cx, cy = 0.5 * (nx - 1), 0.5 * (ny - 1)
-    default_radius = 0.03 * min(nx, ny)
-
-    def _load_region(reg_path, label):
-        try:
-            return (
-                region_to_pixel(
-                    parse_region_file(reg_path, label),
-                    frame.wcs,
-                    x_low=frame.x_low,
-                    y_low=frame.y_low,
-                    spatial_bin=frame.spatial_bin,
-                ),
-                True,
+def project_epsc_sources(sources: tuple[EpscSource, ...], wcs, detector: str) -> tuple[PixelEpscSource, ...]:
+    if sources and wcs is None:
+        raise ValueError(
+            f"EPSC sources for {NAMES.detector_label(detector)} require a celestial WCS"
+        )
+    projected: list[PixelEpscSource] = []
+    for source in sources:
+        x, y = wcs.world_to_pixel(source.center)
+        x = float(x)
+        y = float(y)
+        if not math.isfinite(x) or not math.isfinite(y):
+            raise ValueError(
+                f"Could not project EPSC source row {source.number} for "
+                f"{NAMES.detector_label(detector)}"
             )
-        except FileNotFoundError:
-            terminal_warning(f"region file not found, placing {label} at image center", (("path", reg_path),))
-            return PixelCircle(label, cx, cy, default_radius), False
+        projected.append(PixelEpscSource(source.number, source.name, source.snr, x, y))
+    return tuple(projected)
 
-    src_region, src_region_found = _load_region(src_reg, src_reg.name)
-    bkg_region, bkg_region_found = _load_region(bkg_reg, bkg_reg.name)
-    if INSTRUMENT_NAME == "wxt" and not bkg_region_found:
-        if src_region_found:
-            bx = src_region.x + max(3.0 * src_region.radius, default_radius)
-            by = src_region.y
-        else:
-            bx = cx + 3.0 * default_radius
-            by = cy
-        bx, by = clamp_center(bx, by, bkg_region.radius, counts)
-        bkg_region = PixelCircle(bkg_region.label, bx, by, bkg_region.radius)
-    src_circle = PixelCircle(src_region.label, src_region.x, src_region.y, src_region.radius) if isinstance(src_region, PixelAnnulus) else src_region
-    bkg_circle = PixelCircle(bkg_region.label, bkg_region.x, bkg_region.y, bkg_region.radius) if isinstance(bkg_region, PixelAnnulus) else bkg_region
+
+def _format_snr_threshold(value: float) -> str:
+    return f"{value:g}"
+
+
+def draw_epsc_sources(
+    ax,
+    sources: tuple[PixelEpscSource, ...],
+    color: str,
+    snr_threshold: float,
+) -> tuple:
+    """Draw numbered, fixed-screen-size EPSC markers on one axes."""
+    artists = []
+    legend_seen = {"high": False, "low": False}
+    threshold_label = _format_snr_threshold(snr_threshold)
+    for source in sources:
+        is_low_snr = source.snr < snr_threshold
+        category = "low" if is_low_snr else "high"
+        source_color = DEFAULT_EPSC_LOW_SNR_COLOR if is_low_snr else color
+        legend_label = "_nolegend_"
+        if not legend_seen[category]:
+            operator = "<" if is_low_snr else "≥"
+            legend_label = f"EPSC SNR {operator} {threshold_label}"
+            legend_seen[category] = True
+        marker, = ax.plot(
+            [source.x],
+            [source.y],
+            marker="o",
+            markersize=7,
+            markerfacecolor="none",
+            markeredgecolor=source_color,
+            markeredgewidth=1.25,
+            linestyle="none",
+            label=legend_label,
+            zorder=8,
+        )
+        number = ax.annotate(
+            str(source.number),
+            (source.x, source.y),
+            xytext=(5, 5),
+            textcoords="offset points",
+            color=source_color,
+            fontsize=8,
+            ha="left",
+            va="bottom",
+            bbox={"facecolor": "black", "edgecolor": "none", "alpha": 0.55, "pad": 0.4},
+            annotation_clip=True,
+            zorder=9,
+        )
+        artists.extend((marker, number))
+    return tuple(artists)
+
+
+def _build_panel(fig, n: int, idx: int, detector: str, eventfile: Path, project_dir: Path, frame,
+                 cmap, src_model: SkyRegion, bkg_model: SkyRegion, reference_regions: tuple,
+                 reference_color: str, epsc_sources: tuple[EpscSource, ...], epsc_color: str,
+                 epsc_snr_threshold: float, args, src_reg: Path, bkg_reg: Path,
+                 mkf_file: Path | None) -> DetectorPanel:
+    counts = frame.counts
     masked_counts = np.ma.masked_less_equal(counts, 0)
-
-    cmap = resolve_cmap(args.cmap)
-    cmap.set_bad("black")
-    cmap.set_under("black")
     norm = log_norm_for(counts)
+    sx, sy, sr, _sir = src_model.project(frame.wcs)
+    bx, by, br, _bir = bkg_model.project(frame.wcs)
+    src_circle = PixelCircle(src_reg.name, sx, sy, sr)
+    bkg_circle = PixelCircle(bkg_reg.name, bx, by, br)
+    reference_pixels = tuple(region_to_pixel(region, frame.wcs) for region in reference_regions)
+    epsc_pixels = project_epsc_sources(epsc_sources, frame.wcs, detector)
 
-    fig = plt.figure(figsize=(8.2, 7.4), facecolor="black")
-    ax = fig.add_subplot(111, projection=frame.wcs) if frame.wcs is not None else fig.add_subplot(111)
-    fig.subplots_adjust(left=0.10, right=0.88, bottom=0.09, top=0.92)
+    ax = fig.add_subplot(1, n, idx + 1, projection=frame.wcs) if frame.wcs is not None else fig.add_subplot(1, n, idx + 1)
     apply_ds9_axes_style(ax)
     image = ax.imshow(masked_counts, origin="lower", cmap=cmap, norm=norm, interpolation="nearest")
     src_main_patches = draw_region(ax, src_circle, "red")
     bkg_main_patches = draw_region(ax, bkg_circle, "cyan")
-    main_x0, main_x1, main_y0, main_y1 = display_limits_for(counts, (src_circle, bkg_circle), args.main_size)
+    reference_main_artists = tuple(
+        artist
+        for region in reference_pixels
+        for artist in draw_reference_region(ax, region, reference_color)
+    )
+    draw_epsc_sources(ax, epsc_pixels, epsc_color, epsc_snr_threshold)
+    epsc_bounds = tuple(
+        PixelCircle(str(source.number), source.x, source.y, 0.0) for source in epsc_pixels
+    )
+    main_x0, main_x1, main_y0, main_y1 = display_limits_for(
+        counts, (src_circle, bkg_circle, *reference_pixels, *epsc_bounds), args.main_size
+    )
     ax.set_xlim(main_x0, main_x1)
     ax.set_ylim(main_y0, main_y1)
     ax.set_aspect("equal")
@@ -3547,6 +4415,12 @@ def build_viewer(args: argparse.Namespace):
     inset_image = inset.imshow(masked_counts, origin="lower", cmap=cmap, norm=norm, interpolation="nearest")
     src_inset_patches = draw_region(inset, src_circle, "red")
     bkg_inset_patches = draw_region(inset, bkg_circle, "cyan")
+    reference_inset_artists = tuple(
+        artist
+        for region in reference_pixels
+        for artist in draw_reference_region(inset, region, reference_color)
+    )
+    draw_epsc_sources(inset, epsc_pixels, epsc_color, epsc_snr_threshold)
     inset.set_aspect("equal")
     inset.set_box_aspect(1)
     inset.set_title("Source zoom", fontsize=9, color="white")
@@ -3559,25 +4433,134 @@ def build_viewer(args: argparse.Namespace):
         inset.coords[0].set_axislabel("")
         inset.coords[1].set_axislabel("")
 
-    controller = InteractiveZoom(
-        fig=fig,
-        ax=ax,
-        inset=inset,
-        counts=counts,
+    label = NAMES.detector_label(detector) if detector else eventfile.name
+    return DetectorPanel(
+        detector=detector or "single",
+        label=label,
+        frame=frame,
         masked_counts=masked_counts,
-        image=image,
-        inset_image=inset_image,
-        wcs=frame.wcs,
         eventfile=eventfile,
         project_dir=project_dir,
-        src_reg=src_reg,
-        bkg_reg=bkg_reg,
-        src_circle=src_circle,
-        bkg_circle=bkg_circle,
-        src_region=src_region,
-        bkg_region=bkg_region,
+        mkf_file=mkf_file,
+        ax=ax,
+        inset=inset,
+        image=image,
+        inset_image=inset_image,
         src_patches=(*src_main_patches, *src_inset_patches),
         bkg_patches=(*bkg_main_patches, *bkg_inset_patches),
+        reference_artists=(*reference_main_artists, *reference_inset_artists),
+        src_reg=src_reg,
+        bkg_reg=bkg_reg,
+    )
+
+
+def build_viewer(args: argparse.Namespace):
+    event_list, project_dir = resolve_event_files(args.path, args.detector)
+    src_reg = resolve_region(args.src_reg, project_dir)
+    bkg_reg = resolve_region(args.bkg_reg, project_dir)
+    config = getattr(args, "_config", None) or {}
+    reference_regions, reference_region_path = reference_regions_from_config(config, project_dir)
+    reference_color = configured_overlay_color(
+        config, "reference_region", DEFAULT_REFERENCE_COLOR
+    )
+    cli_mkf = resolve_optional_mkf(args.mkf, project_dir)
+    if cli_mkf is not None and not cli_mkf.is_file():
+        raise FileNotFoundError(f"MKF file not found: {cli_mkf}")
+
+    frames = [
+        (det, eventfile, load_frame(eventfile, "EVENTS", "X", "Y", spatial_bin=args.spatial_bin))
+        for det, eventfile in event_list
+    ]
+    dual = len(frames) > 1
+    if dual and any(frame.wcs is None for _, _, frame in frames):
+        # FK5-linked regions require a celestial WCS on every panel.
+        terminal_warning(
+            "parallel view needs celestial WCS on both detectors; falling back to single detector",
+            (("detector", frames[0][0]),),
+        )
+        frames = frames[:1]
+        dual = False
+
+    epsc_sources, epsc_paths = epsc_sources_from_config(
+        config, project_dir, tuple(detector for detector, _, _ in frames)
+    )
+    epsc_color = configured_overlay_color(config, "epsc_sources", DEFAULT_EPSC_COLOR)
+    epsc_snr_threshold = epsc_snr_threshold_from_config(config)
+
+    primary_det, primary_event, primary_frame = frames[0]
+    output = Path(args.output).expanduser().resolve() if args.output else default_output_path(primary_event, project_dir)
+
+    pny, pnx = primary_frame.counts.shape
+    pcx, pcy = 0.5 * (pnx - 1), 0.5 * (pny - 1)
+    default_radius = 0.03 * min(pnx, pny)
+
+    def _load_region(reg_path, label):
+        try:
+            return (
+                region_to_pixel(
+                    parse_region_file(reg_path, label),
+                    primary_frame.wcs,
+                    x_low=primary_frame.x_low,
+                    y_low=primary_frame.y_low,
+                    spatial_bin=primary_frame.spatial_bin,
+                ),
+                True,
+            )
+        except FileNotFoundError:
+            return PixelCircle(label, pcx, pcy, default_radius), False
+
+    src_region, src_region_found = _load_region(src_reg, src_reg.name)
+    bkg_region, bkg_region_found = _load_region(bkg_reg, bkg_reg.name)
+    if not src_region_found:
+        terminal_warning(
+            f"region file not found, placing {src_reg.name} at image center",
+            (("path", src_reg),),
+        )
+    if not bkg_region_found:
+        bkg_region = offset_generated_background(
+            src_region,
+            bkg_region,
+            primary_frame.counts,
+        )
+        terminal_warning(
+            f"region file not found, placing {bkg_reg.name} with an offset from source",
+            (("path", bkg_reg),),
+        )
+
+    src_type = "annulus" if isinstance(src_region, PixelAnnulus) and src_region.inner_radius > 0 else "circle"
+    bkg_type = "annulus" if isinstance(bkg_region, PixelAnnulus) and bkg_region.inner_radius > 0 else "circle"
+    src_inner = float(src_region.inner_radius) if isinstance(src_region, PixelAnnulus) else 0.0
+    bkg_inner = float(bkg_region.inner_radius) if isinstance(bkg_region, PixelAnnulus) else 0.0
+    src_model = SkyRegion.from_pixels(primary_frame.wcs, src_region.x, src_region.y, src_region.radius, src_inner, src_type)
+    bkg_model = SkyRegion.from_pixels(primary_frame.wcs, bkg_region.x, bkg_region.y, bkg_region.radius, bkg_inner, bkg_type)
+
+    cmap = resolve_cmap(args.cmap)
+    cmap.set_bad("black")
+    cmap.set_under("black")
+
+    n = len(frames)
+    fig = plt.figure(figsize=((7.7 * n, 7.4) if dual else (8.2, 7.4)), facecolor="black")
+    if dual:
+        fig.subplots_adjust(left=0.06, right=0.95, bottom=0.09, top=0.90, wspace=0.30)
+    else:
+        fig.subplots_adjust(left=0.10, right=0.88, bottom=0.09, top=0.92)
+
+    panels = [
+        _build_panel(
+            fig, n, idx, det, eventfile, project_dir, frame, cmap, src_model,
+            bkg_model, reference_regions, reference_color, epsc_sources.get(det, ()),
+            epsc_color, epsc_snr_threshold, args, src_reg, bkg_reg, cli_mkf,
+        )
+        for idx, (det, eventfile, frame) in enumerate(frames)
+    ]
+
+    controller = InteractiveZoom(
+        fig=fig,
+        panels=panels,
+        src_region=src_model,
+        bkg_region=bkg_model,
+        src_region_type=src_type,
+        bkg_region_type=bkg_type,
         zoom_factor=args.zoom_factor,
         output=output,
         dpi=args.dpi,
@@ -3588,19 +4571,24 @@ def build_viewer(args: argparse.Namespace):
         extract_dir=args.extract_dir,
         module_name=args.module,
         modules_init=args.modules_init,
-        mkf_file=mkf_file,
         psfcor=args.psfcor,
         drag_region_body=args.drag_region_body,
     )
-    return fig, controller, eventfile, src_reg, bkg_reg, output
+    controller.reference_regions = reference_regions
+    controller.reference_region_path = reference_region_path
+    controller.reference_region_color = reference_color
+    controller.epsc_sources = epsc_sources
+    controller.epsc_paths = epsc_paths
+    controller.epsc_color = epsc_color
+    controller.epsc_snr_threshold = epsc_snr_threshold
+    return fig, controller, primary_event, src_reg, bkg_reg, output
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     # Fix the HEASOFT invocation mode for the whole run (and for the forked LC window,
-    # which re-enters main() with --heasoft-mode forwarded). Any value other than
-    # "module" is treated as the default "headas" mode.
+    # which re-enters main() with --heasoft-mode forwarded).
     global HEASOFT_MODE, NAMES, CONFIG_PATH, INSTRUMENT_NAME, RESPONSE_FILES_MODE, ENERGY_FILTER, SOURCE_ID
     HEASOFT_MODE = "module" if args.heasoft_mode == "module" else "headas"
     NAMES = IONames.from_config(getattr(args, "_config", None))
@@ -3612,7 +4600,7 @@ def main(argv: list[str] | None = None) -> int:
     CONFIG_PATH = args.config
 
     if args.plot_lc:
-        set_terminal_hints("=/- 1s  ctrl+/- 10s  cmd+/- 100s  |  g=GTI  drag=select  enter=extract  u=undo  esc=clear")
+        set_terminal_hints("=/- 1s  ctrl+/- 10s  cmd+/- 100s  |  g=GTI  drag=select  enter=extract  x=XSPEC(first)  u=undo  esc=clear")
         backend = plt.get_backend().lower()
         if backend in {"agg", "pdf", "ps", "svg", "template"}:
             terminal_error(
@@ -3625,7 +4613,38 @@ def main(argv: list[str] | None = None) -> int:
             lc_eventfile = Path(args.lc_eventfile).expanduser().resolve() if args.lc_eventfile else None
             lc_project_dir = Path(args.lc_project_dir).expanduser().resolve() if args.lc_project_dir else None
             lc_mkf = Path(args.lc_mkf).expanduser().resolve() if args.lc_mkf else None
-            if args.watch_lc:
+            if args.dual_lc and args.plot_lc_b:
+                lc_path_b = Path(args.plot_lc_b).expanduser().resolve()
+                tracks_spec = [
+                    {
+                        "path": lc_path,
+                        "title": args.plot_title,
+                        "detector": "a",
+                        "eventfile": lc_eventfile,
+                        "project_dir": lc_project_dir,
+                        "mkf": lc_mkf,
+                    },
+                    {
+                        "path": lc_path_b,
+                        "title": args.plot_title_b,
+                        "detector": "b",
+                        "eventfile": Path(args.lc_eventfile_b).expanduser().resolve() if args.lc_eventfile_b else None,
+                        "project_dir": Path(args.lc_project_dir_b).expanduser().resolve() if args.lc_project_dir_b else None,
+                        "mkf": Path(args.lc_mkf_b).expanduser().resolve() if args.lc_mkf_b else None,
+                    },
+                ]
+                watch_paths = None
+                if args.watch_lc:
+                    watch_paths = [
+                        Path(args.watch_lc).expanduser().resolve(),
+                        Path(args.watch_lc_b).expanduser().resolve() if args.watch_lc_b else None,
+                    ]
+                plot_lightcurve_dual(tracks_spec, args.lc_bin, args.module, args.modules_init, args.psfcor, watch_paths)
+                terminal_block(
+                    "LC window",
+                    (("file", lc_path), ("file", lc_path_b), ("bin", format_lc_bin(args.lc_bin))),
+                )
+            elif args.watch_lc:
                 plot_lightcurve_watch(
                     lc_path,
                     Path(args.watch_lc).expanduser().resolve(),
@@ -3638,6 +4657,7 @@ def main(argv: list[str] | None = None) -> int:
                     lc_mkf,
                     args.psfcor,
                 )
+                terminal_block("LC window", (("file", lc_path), ("bin", format_lc_bin(args.lc_bin))))
             else:
                 plot_lightcurve(
                     lc_path,
@@ -3650,20 +4670,14 @@ def main(argv: list[str] | None = None) -> int:
                     lc_mkf,
                     args.psfcor,
                 )
-            terminal_block(
-                "LC window",
-                (
-                    ("file", lc_path),
-                    ("bin", format_lc_bin(args.lc_bin)),
-                ),
-            )
+                terminal_block("LC window", (("file", lc_path), ("bin", format_lc_bin(args.lc_bin))))
         except Exception as exc:
             terminal_error(str(exc))
             return 1
         plt.show()
         return 0
 
-    set_terminal_hints("e=LC/spec  x=XSPEC  c=centroid  b=auto-bkg  tab=type  z=zoom  s=save  r=reset  q=quit")
+    set_terminal_hints("e=LC/spec  x=XSPEC  c=centroid  b=auto-bkg  tab=type  z=zoom  r=reference  R=reset  s=save  q=quit")
 
     try:
         fig, controller, eventfile, src_reg, bkg_reg, output = build_viewer(args)
@@ -3671,25 +4685,44 @@ def main(argv: list[str] | None = None) -> int:
         terminal_error(str(exc))
         return 1
 
-    terminal_block(
-        "viewer ready",
-        (
-            ("event", eventfile),
-            ("src reg", src_reg),
-            ("bkg reg", bkg_reg),
-            ("save", output),
-        ),
-    )
+    ready_rows: list[tuple[str, object]] = [
+        ("event", eventfile),
+        ("src reg", src_reg),
+        ("bkg reg", bkg_reg),
+    ]
+    if controller.reference_regions:
+        reference_source = controller.reference_region_path or "inline TOML"
+        ready_rows.append(
+            ("reference", f"{reference_source} ({len(controller.reference_regions)} region(s))")
+        )
+    for detector, path in controller.epsc_paths.items():
+        ready_rows.append(
+            (
+                f"EPSC {NAMES.detector_label(detector)}",
+                f"{path} ({len(controller.epsc_sources[detector])} source(s))",
+            )
+        )
+    if controller.epsc_paths:
+        ready_rows.append(
+            (
+                "EPSC SNR",
+                f"< {_format_snr_threshold(controller.epsc_snr_threshold)} shown gray",
+            )
+        )
+    ready_rows.append(("save", output))
+    terminal_block("viewer ready", tuple(ready_rows))
 
     if args.dry_run:
-        x0, x1, y0, y1 = controller.bounds
-        terminal_block(
-            "dry run",
-            (
-                ("zoom xlim", f"({x0:.6g}, {x1:.6g})"),
-                ("zoom ylim", f"({y0:.6g}, {y1:.6g})"),
-            ),
-        )
+        rows = [
+            ("panels", len(controller.panels)),
+            ("reference regions", len(controller.reference_regions)),
+        ]
+        for detector, sources in controller.epsc_sources.items():
+            rows.append((f"EPSC {NAMES.detector_label(detector)}", len(sources)))
+        for panel in controller.panels:
+            x0, x1, y0, y1 = panel.bounds
+            rows.append((f"{panel.label} zoom", f"x=({x0:.6g}, {x1:.6g}) y=({y0:.6g}, {y1:.6g})"))
+        terminal_block("dry run", tuple(rows))
         return 0
 
     backend = plt.get_backend().lower()

@@ -9,14 +9,12 @@ name = "fxt"
 
 [heasoft]
 # How ds8 reaches the fxtsoft/HEASOFT tools.
-#   "headas" (default): use the $HEADAS from `source .../headas-init.sh`;
-#                       xselect / xspec / fxt* are found on PATH. No Modules needed.
-#   "module":           load them through Environment Modules instead -- set
-#                       mode = "module" and fill in the two lines below
-#                       (modules_init path is machine-specific; see README).
-mode = "headas"
-# module = "heasoft/fxt1.30"
-# modules_init = "/opt/homebrew/opt/modules/init/profile.sh"
+#   "module" (default): load tools through Environment Modules. The init path is
+#                       machine-specific, so adjust it for your installation.
+#   "headas":           use $HEADAS from `source .../headas-init.sh` instead.
+mode = "module"
+module = "heasoft/fxt1.30"
+modules_init = "/opt/homebrew/opt/modules/init/profile.sh"
 
 [inputs]
 event = "fxt_{detector}_*_po_cl_*.fits"
@@ -25,6 +23,26 @@ mkf = "fxt_*_mkf_*.fits"
 # image centre. Overridable per-run with --src-reg / --bkg-reg.
 src_region = "src.reg"
 bkg_region = "bkg.reg"
+
+[reference_region]
+# Optional, read-only FK5 overlay (purple dashed line by default). It is not used for
+# extraction. Choose ONE form; numeric radius values are degrees.
+# ra = 83.633083
+# dec = 22.014500
+# radius = "30arcsec"
+# label = "catalog position"
+# color = "#DA70D6"
+# Or load every circle/annulus in one DS9 FK5 file (relative to this directory):
+# file = "reference.reg"
+
+[epsc_sources]
+# Optional detector-specific EPSC pipeline catalogs. When enabled, declare the CSV
+# for every detector being displayed. Sources are numbered in CSV row order and
+# drawn only on their own detector panel, in green by default.
+# a = "srca.csv"  # FXTA
+# b = "srcb.csv"  # FXTB
+# color = "#7CFC00"
+# snr_threshold = 7.0  # sources below this value are drawn gray
 
 [detectors]
 default = "b"

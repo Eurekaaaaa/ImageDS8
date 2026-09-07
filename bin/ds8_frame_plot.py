@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import os
 from pathlib import Path
@@ -319,11 +319,18 @@ def load_frame(
         return FrameImage(counts=counts, wcs=wcs, event_header=header, spatial_bin=spatial_bin, x_low=xmin, y_low=ymin)
 
 
-def parse_region_file(path: Path, label: str) -> ParsedRegion:
+def parse_region_file_all(path: Path, label: str) -> tuple[ParsedRegion, ...]:
+    """Parse every circle/annulus from a DS9 region file.
+
+    Source and background loading historically uses only the first supported shape;
+    reference-region overlays use all of them.  Keeping the common parser here makes
+    coordinate-system handling identical for both paths.
+    """
     if not path.is_file():
         raise FileNotFoundError(f"Region file not found: {path}")
 
     current_system = "image"
+    regions: list[ParsedRegion] = []
     for raw_line in path.read_text().splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or line.lower().startswith("global"):
@@ -342,29 +349,47 @@ def parse_region_file(path: Path, label: str) -> ParsedRegion:
                 values = [part.strip() for part in match.group("body").split(",")]
                 if len(values) != 4:
                     raise ValueError(f"Unsupported annulus region in {path}: {token}")
-                return AnnulusRegion(
-                    label=label,
-                    system=current_system,
-                    x_text=values[0],
-                    y_text=values[1],
-                    inner_radius_text=values[2],
-                    outer_radius_text=values[3],
+                regions.append(
+                    AnnulusRegion(
+                        label=label,
+                        system=current_system,
+                        x_text=values[0],
+                        y_text=values[1],
+                        inner_radius_text=values[2],
+                        outer_radius_text=values[3],
+                    )
                 )
+                continue
             match = re.match(r"circle\s*\((?P<body>[^)]*)\)", token, flags=re.IGNORECASE)
             if match is None:
                 continue
             values = [part.strip() for part in match.group("body").split(",")]
             if len(values) != 3:
                 raise ValueError(f"Unsupported circle region in {path}: {token}")
-            return CircleRegion(
-                label=label,
-                system=current_system,
-                x_text=values[0],
-                y_text=values[1],
-                radius_text=values[2],
+            regions.append(
+                CircleRegion(
+                    label=label,
+                    system=current_system,
+                    x_text=values[0],
+                    y_text=values[1],
+                    radius_text=values[2],
+                )
             )
 
-    raise ValueError(f"No circle or annulus region found in {path}")
+    if not regions:
+        raise ValueError(f"No circle or annulus region found in {path}")
+    if len(regions) == 1:
+        return tuple(regions)
+    # Give each shape a distinct legend label without requiring DS9 text metadata.
+    return tuple(
+        replace(region, label=f"{label} #{index}")
+        for index, region in enumerate(regions, 1)
+    )
+
+
+def parse_region_file(path: Path, label: str) -> ParsedRegion:
+    """Return the first supported region (the source/background compatibility API)."""
+    return parse_region_file_all(path, label)[0]
 
 
 def parse_angle_degrees(text: str) -> float:
@@ -404,6 +429,19 @@ def angular_radius_to_pixels(wcs: WCS, coord: SkyCoord, radius_deg: float) -> fl
             + math.hypot(float(x2 - x0), float(y2 - y0))
         )
     )
+
+
+def pixel_radius_to_angular(wcs: WCS, coord: SkyCoord, pixel_radius: float) -> float:
+    """Inverse of :func:`angular_radius_to_pixels`: pixel radius at ``coord`` -> degrees.
+
+    Estimates the local plate scale (pixels per degree) from a 1 arcsec probe offset
+    and inverts it. Used to fold a dragged pixel radius back into the shared sky model.
+    """
+    probe_deg = 1.0 / 3600.0
+    px_per_deg = angular_radius_to_pixels(wcs, coord, probe_deg) / probe_deg
+    if px_per_deg <= 0:
+        return 0.0
+    return float(pixel_radius) / px_per_deg
 
 
 def region_to_pixel_circle(
@@ -553,6 +591,59 @@ def draw_region(ax, region: PixelRegion, color: str) -> tuple:
     if isinstance(region, PixelAnnulus) and region.inner_radius > 0:
         inner_outline = Circle((region.x, region.y), region.inner_radius, fill=False, lw=2.0, ec="black", alpha=0.9, ls="--")
         inner_circle = Circle((region.x, region.y), region.inner_radius, fill=False, lw=1.1, ec=color, ls="--")
+        ax.add_patch(inner_outline)
+        ax.add_patch(inner_circle)
+        return outline, circle, inner_outline, inner_circle
+    return outline, circle
+
+
+def draw_reference_region(ax, region: PixelRegion, color: str = "#DA70D6") -> tuple:
+    """Draw a static reference overlay, visually distinct from extraction regions."""
+    outline = Circle(
+        (region.x, region.y),
+        region.radius,
+        fill=False,
+        lw=2.4,
+        ec="black",
+        alpha=0.9,
+        ls="--",
+        label="_nolegend_",
+        zorder=6,
+    )
+    circle = Circle(
+        (region.x, region.y),
+        region.radius,
+        fill=False,
+        lw=1.2,
+        ec=color,
+        ls="--",
+        label=region.label,
+        zorder=6,
+    )
+    ax.add_patch(outline)
+    ax.add_patch(circle)
+    if isinstance(region, PixelAnnulus) and region.inner_radius > 0:
+        inner_outline = Circle(
+            (region.x, region.y),
+            region.inner_radius,
+            fill=False,
+            lw=2.4,
+            ec="black",
+            alpha=0.9,
+            ls=":",
+            label="_nolegend_",
+            zorder=6,
+        )
+        inner_circle = Circle(
+            (region.x, region.y),
+            region.inner_radius,
+            fill=False,
+            lw=1.2,
+            ec=color,
+            ls=":",
+            label="_nolegend_",
+            zorder=6,
+        )
         ax.add_patch(inner_outline)
         ax.add_patch(inner_circle)
         return outline, circle, inner_outline, inner_circle
