@@ -24,18 +24,17 @@ set_headas.sh   README.md   CN_README.md
   ```
 - **fxtdas**（IHEP 的 EP/FXT 数据处理软件包：https://epfxt.ihep.ac.cn/analysis ）
 - **CALDB**（需注册 EP 仪器，详见 fxtdas 手册）
-- **Environment Modules**（默认 `module` 模式需要；也可改用 `headas` 模式并自行 source HEASOFT）
+- **Environment Modules**（可选），用于在 `module` 模式下管理 HEASOFT/fxtsoft
+  版本与 `PATH`
 
 ## 安装与环境
 
 `bin/` 内 6 个文件须同目录（主程序按同目录定位其余脚本与配置模板）。
 
-ImageDS8 默认使用 **module 模式**。生成的 TOML 会在每次运行命令时加载指定的
-HEASOFT/fxtsoft module；请按本机环境修改其中的 `module` 与 `modules_init`。
-启动 `ds8` 的 shell 仍需预先初始化 CALDB。
-
-若要使用原来的 `headas` 模式，请在 TOML 中设置 `mode = "headas"`，并在运行前
-source 所需的 HEASOFT 环境，例如：
+多数用户可直接使用标准的、已经初始化好的 **HEADAS** 环境运行 ImageDS8。
+在观测目录生成的 TOML 中设置 `mode = "headas"`，并在启动 `ds8` 的 shell 中
+初始化 HEASOFT/fxtsoft 与 CALDB。可以按本机安装路径修改并 source 仓库附带的
+`set_headas.sh`，例如：
 
 ```bash
 export PATH="/path/to/ImageDS8/bin:$PATH"
@@ -45,33 +44,68 @@ export PATH="/path/to/ImageDS8/bin:$PATH"
 source /path/to/set_headas.sh        # fxtsoft (HEASOFT) + CALDB
 ```
 
+ImageDS8 同时兼容 **Environment Modules**，可将它作为可选的 PATH 与版本管理器。
+若系统提供相应 module，可在 TOML 中选择 `mode = "module"`，并配置 `module` 与
+`modules_init`。这种模式下仍需在启动 shell 中单独初始化 CALDB。
+
 ## 快速上手
 
-假设 `ds8` 已在 `PATH` 上、Python 依赖已装好（见[依赖](#依赖)与[安装与环境](#安装与环境)）。
+假设 `ds8` 已在 `PATH` 上、Python 依赖已装好（见[依赖](#依赖)与
+[安装与环境](#安装与环境)）。以下示例采用标准 HEADAS 工作流：在生成的 TOML 中设置
 
-1. **进入观测目录**，目录里须同时有 FXT-A、FXT-B 的 cleaned 事件文件和 MKF 文件，例如 `fxt_a_*_po_cl_*.fits`、`fxt_b_*_po_cl_*.fits`、`fxt_*_mkf_*.fits`：
+```toml
+[heasoft]
+mode = "headas"
+```
+
+并在启动 `ds8` 前初始化 HEASOFT/fxtsoft 与 CALDB。若使用 Environment Modules
+管理这些工具，则保留 `mode = "module"`，配置 `module` 与 `modules_init`，并另行
+初始化 CALDB。
+
+### WXT
+
+1. **进入 WXT 观测目录。** 目录中应包含 cleaned 事件文件，以及所选源对应的已有
+   RMF/ARF。默认匹配模式为 `ep*wxt*po_cl.evt`、`ep*wxt*.rmf` 和
+   `ep*wxt*s1.arf`：
 
    ```bash
-   cd /path/to/obsdir
+   cd /path/to/wxt-obsdir
    ```
 
-2. **生成配置文件**——向目录写入 `ds8-fxt.toml` 后退出（不启动）；默认不合适就编辑它：
+2. **生成 WXT 配置。** 此命令写入 `ds8-wxt.toml` 后退出。若源编号或产品文件名不同，
+   请检查 `[instrument].source` 和 `[inputs]` 下的匹配模式：
+
+   ```bash
+   ds8 --inst wxt .
+   ```
+
+3. **启动并提取：**
+
+   ```bash
+   ds8 .
+   ```
+
+   在图像窗口里拖动源区和背景区，按 **`e`** 提取光变，再按一次 **`e`** 使用已有的
+   WXT 响应文件提取能谱，按 **`x`** 打开 XSPEC。
+
+### FXT
+
+1. **进入 FXT 观测目录。** 目录中须包含 FXT-A 和/或 FXT-B 的 cleaned 事件文件，
+   以及对应的 MKF 文件，例如 `fxt_a_*_po_cl_*.fits`、`fxt_b_*_po_cl_*.fits` 和
+   `fxt_*_mkf_*.fits`：
+
+   ```bash
+   cd /path/to/fxt-obsdir
+   ```
+
+2. **生成 FXT 配置。** 此命令写入 `ds8-fxt.toml` 后退出；默认设置不合适时请编辑
+   生成的文件：
 
    ```bash
    ds8 --inst fxt .
    ```
 
-3. **配置 module 并初始化 CALDB**——检查生成的 TOML 中
-   `[heasoft].module` 与 `[heasoft].modules_init`，然后在当前 shell 初始化 CALDB：
-
-   ```bash
-   export CALDB=/path/to/CALDB
-   source "$CALDB/software/tools/caldbinit.sh"
-   ```
-
-   若配置为 `mode = "headas"`，则改为 source `set_headas.sh`。
-
-4. **启动并提取：**
+3. **启动并提取：**
 
    ```bash
    ds8 .
@@ -83,14 +117,16 @@ source /path/to/set_headas.sh        # fxtsoft (HEASOFT) + CALDB
    `data 2:2` 加载 FXT-B，并分别载入各自的响应文件）。使用 `--detector a` 或 `--detector b`
    可强制回到单探测器视图。
 
-   在图像窗口里拖动源圈、背景圈到位，按 **`e`** 取光变，再按一次 **`e`** 取能谱。
+   在图像窗口里拖动源圈、背景圈到位，按 **`e`** 提取光变（两个探测器分别显示为
+   两个子图），再按一次 **`e`** 提取两个探测器的能谱，按 **`x`** 在 XSPEC 中加载它们。
 
 ## 用法
 
 ```bash
 ds8 <观测目录> --inst fxt         # 仅生成：向 <观测目录> 写入 ds8-fxt.toml 后退出（不启动）
 ds8 <观测目录> --inst wxt         # 仅生成：向 <观测目录> 写入 ds8-wxt.toml 后退出（不启动）
-ds8 <观测目录>                    # 启动：要求 <观测目录> 里已有 ds8*.toml（缺失则报错）
+ds8 <观测目录>                    # 启动：WXT 单视图；同时存在 FXT-A/B 时打开并排视图
+ds8 <观测目录> --detector b       # FXT：强制使用经典的单探测器视图
 ```
 
 `--inst` 从不启动，也从不覆盖已存在的 `ds8-<inst>.toml`。编辑生成的副本后，再用 `ds8 <观测目录>` 启动。`bin/` 里的捆绑模板只会以这种方式复制出去，绝不直接驱动任何运行中的会话。
@@ -181,9 +217,19 @@ source 以固定显示尺寸的空心圆标记，并严格按 CSV 数据行顺�
 低于 `snr_threshold` 的圆圈和数字自动改为灰色，其余使用 `color`。
 这些标记仅用于显示，不参与提取。用 `--detector` 强制单探测器视图时，只需声明该探测器的 CSV。
 
-### Environment Modules（默认）
+### HEASOFT 环境
 
-默认 module 模式由目录内 TOML 的 `[heasoft]` 段配置（CALDB 仍需自行 source）：
+通常使用已经初始化好的 HEADAS 环境：
+
+```toml
+[heasoft]
+mode = "headas"
+```
+
+在这种模式下，`ds8` 使用 `$HEADAS` 以及当前 `PATH` 中的 HEASOFT/fxtsoft 命令。
+启动前还需在同一个 shell 中初始化 CALDB。
+
+Environment Modules 也可作为可选的 PATH/版本管理器：
 
 ```toml
 [heasoft]
@@ -192,5 +238,5 @@ module = "heasoft/fxt1.30"
 modules_init = "/opt/homebrew/opt/modules/init/profile.sh"
 ```
 
-亦可用环境变量 `DS8_HEASOFT_MODE` / `HEASOFT_MODULE` / `MODULES_INIT` 覆盖，
-或设为 `mode = "headas"`，使用已初始化的 `$HEADAS` 环境。
+module 模式下仍需在启动 shell 中初始化 CALDB。环境变量 `DS8_HEASOFT_MODE`、
+`HEASOFT_MODULE` 和 `MODULES_INIT` 可覆盖 TOML 设置。

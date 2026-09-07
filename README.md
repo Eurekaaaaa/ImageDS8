@@ -27,19 +27,17 @@ set_headas.sh   README.md   CN_README.md
   ```
 - **fxtdas** (bundled EP/FXT data reduction package by IHEP: https://epfxt.ihep.ac.cn/analysis )
 - **CALDB** (require register of EP instruments. see fxtdas manual)
-- **Environment Modules** for the default `module` mode (or select `headas` mode
-  and source HEASOFT yourself)
+- **Environment Modules** (optional) when using `module` mode to manage the
+  HEASOFT/fxtsoft version and `PATH`
 
 ## Install & environment
 
 Keep the 6 files in `bin/` together (the main script locates the other scripts and the config templates relative to itself). 
 
-ImageDS8 defaults to **module mode**. The generated TOML loads the configured
-HEASOFT/fxtsoft module for each command; adjust `module` and `modules_init` there
-for your machine. CALDB must still be initialized in the shell that launches `ds8`.
-
-If you prefer the former `headas` mode, set `mode = "headas"` in the TOML and
-source your desired HEASOFT version before running, for example:
+Most users run ImageDS8 with a standard, already initialized **HEADAS** environment.
+Set `mode = "headas"` in the observation's generated TOML, then initialize
+HEASOFT/fxtsoft and CALDB in the shell that launches `ds8`. The bundled
+`set_headas.sh` can be edited for the local installation and sourced, for example:
 
 ```bash
 export PATH="/path/to/ImageDS8/bin:$PATH"
@@ -49,33 +47,72 @@ export PATH="/path/to/ImageDS8/bin:$PATH"
 source /path/to/set_headas.sh        # fxtsoft (HEASOFT) + CALDB
 ```
 
+ImageDS8 also supports **Environment Modules** as an optional PATH and version
+manager. Users with a suitable module can select `mode = "module"` and configure
+`module` plus `modules_init` in the TOML. CALDB must still be initialized in the
+launching shell.
+
 ## Quickstart
 
-Assumes `ds8` is on `PATH` and the Python deps are installed (see [Prerequisites](#prerequisites) and [Install & environment](#install--environment)).
+Assumes `ds8` is on `PATH` and the Python dependencies are installed (see
+[Prerequisites](#prerequisites) and [Install & environment](#install--environment)).
+The examples below use the standard HEADAS workflow: set the generated TOML to
 
-1. **Enter the observation directory.** It must contain both the FXT-A and FXT-B cleaned event files and the MKF file — e.g. `fxt_a_*_po_cl_*.fits`, `fxt_b_*_po_cl_*.fits`, `fxt_*_mkf_*.fits`:
+```toml
+[heasoft]
+mode = "headas"
+```
+
+and initialize HEASOFT/fxtsoft and CALDB before launching `ds8`. If your system
+uses Environment Modules to manage these tools, keep `mode = "module"`, configure
+`module` and `modules_init`, and initialize CALDB separately.
+
+### WXT
+
+1. **Enter the WXT observation directory.** It should contain the cleaned event
+   file and the existing RMF/ARF for the selected source. The default patterns are
+   `ep*wxt*po_cl.evt`, `ep*wxt*.rmf`, and `ep*wxt*s1.arf`:
 
    ```bash
-   cd /path/to/obsdir
+   cd /path/to/wxt-obsdir
    ```
 
-2. **Scaffold the config** — writes `ds8-fxt.toml` into the directory and exits (does not launch); edit it if the defaults don't fit:
+2. **Scaffold the WXT config** — this writes `ds8-wxt.toml` and exits. Check
+   `[instrument].source` and the patterns under `[inputs]` if the source number or
+   product names differ:
+
+   ```bash
+   ds8 --inst wxt .
+   ```
+
+3. **Launch and extract:**
+
+   ```bash
+   ds8 .
+   ```
+
+   In the image window, drag the source and background regions into place, press
+   **`e`** to extract the light curve, press **`e`** again to extract the spectrum
+   using the existing WXT responses, and press **`x`** to open XSPEC.
+
+### FXT
+
+1. **Enter the FXT observation directory.** It must contain an FXT-A and/or FXT-B
+   cleaned event file and the matching MKF file, for example
+   `fxt_a_*_po_cl_*.fits`, `fxt_b_*_po_cl_*.fits`, and `fxt_*_mkf_*.fits`:
+
+   ```bash
+   cd /path/to/fxt-obsdir
+   ```
+
+2. **Scaffold the FXT config** — this writes `ds8-fxt.toml` and exits. Edit the
+   generated file if the defaults do not fit:
 
    ```bash
    ds8 --inst fxt .
    ```
 
-3. **Configure the module and initialize CALDB** — check `[heasoft].module` and
-   `[heasoft].modules_init` in the generated TOML, then initialize CALDB in this shell:
-
-   ```bash
-   export CALDB=/path/to/CALDB
-   source "$CALDB/software/tools/caldbinit.sh"
-   ```
-
-   For `mode = "headas"`, source `set_headas.sh` instead.
-
-4. **Launch and extract:**
+3. **Launch and extract:**
 
    ```bash
    ds8 .
@@ -95,8 +132,8 @@ Assumes `ds8` is on `PATH` and the Python deps are installed (see [Prerequisites
 ```bash
 ds8 <obsdir> --inst fxt         # Scaffold only: write ds8-fxt.toml into <obsdir> and exit (does not launch).
 ds8 <obsdir> --inst wxt         # Scaffold only: write ds8-wxt.toml into <obsdir> and exit.
-ds8 <obsdir>                    # Launch: parallel A/B view when both event files exist, else single.
-ds8 <obsdir> --detector b       # Launch the classic single-detector view for one detector.
+ds8 <obsdir>                    # Launch: WXT single view, or parallel FXT A/B when both files exist.
+ds8 <obsdir> --detector b       # FXT: force the classic single-detector view.
 ```
 
 `--inst` never launches and never overwrites an existing `ds8-<inst>.toml`. Edit the generated copy, then run `ds8 <obsdir>` to launch. The bundled templates in `bin/` are only ever copied out this way; they never drive a running session.
@@ -192,9 +229,19 @@ Sources below `snr_threshold` are automatically drawn gray; the rest use `color`
 These markers are display-only and do not affect extraction. In a forced
 single-detector view, only that detector's CSV entry is required.
 
-### Environment Modules (default)
+### HEASOFT environment
 
-Module mode is configured in the directory's TOML (you still source CALDB yourself):
+The usual workflow uses an already initialized HEADAS environment:
+
+```toml
+[heasoft]
+mode = "headas"
+```
+
+In this mode, `ds8` uses `$HEADAS` and the HEASOFT/fxtsoft commands already on
+`PATH`. Initialize CALDB in the same shell before launching.
+
+Environment Modules is also supported as an optional PATH/version manager:
 
 ```toml
 [heasoft]
@@ -203,5 +250,6 @@ module = "heasoft/fxt1.30"
 modules_init = "/opt/homebrew/opt/modules/init/profile.sh"
 ```
 
-Override it via `DS8_HEASOFT_MODE` / `HEASOFT_MODULE` / `MODULES_INIT`, or use
-`mode = "headas"` to run against an already initialized `$HEADAS` environment.
+In module mode, CALDB must still be initialized in the launching shell. The
+`DS8_HEASOFT_MODE`, `HEASOFT_MODULE`, and `MODULES_INIT` environment variables can
+override the TOML settings.
