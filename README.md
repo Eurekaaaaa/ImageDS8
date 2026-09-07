@@ -7,13 +7,6 @@ drag regions → extract curve → extract spectra → call XSPEC.
 
 ![ImageDS8 demo](ImageDS8_demo.png)
 
-When both the FXT-A and FXT-B cleaned event files are present, `ds8` opens them
-**side by side in one window**. A single source/background region is shared across
-both detectors by sky (FK5) position — drag it on either panel and it moves on both.
-Light curves, spectra and XSPEC then run for **both detectors in parallel** (XSPEC
-loads them as `data 1:1` FXT-A and `data 2:2` FXT-B with each detector's response
-files). Pass `--detector a` or `--detector b` to force the classic single-detector view.
-
 ```
 bin/  ds8  ds8_frame_plot.py  ds8_io_names.py  xspec_init  ds8-{fxt,wxt}.toml
 set_headas.sh   README.md   CN_README.md
@@ -88,8 +81,13 @@ Assumes `ds8` is on `PATH` and the Python deps are installed (see [Prerequisites
    ds8 .
    ```
 
-   With both FXT-A and FXT-B present this opens the parallel A/B view (one shared
-   FK5 region across both panels); add `--detector a`/`--detector b` for a single detector.
+   When both the FXT-A and FXT-B cleaned event files are present, `ds8` opens them
+   **side by side in one window**. A single source/background region is shared across
+   both detectors by sky (FK5) position — drag it on either panel and it moves on both.
+   Light curves, spectra and XSPEC then run for **both detectors in parallel** (XSPEC
+   loads them as `data 1:1` FXT-A and `data 2:2` FXT-B with each detector's response
+   files). Pass `--detector a` or `--detector b` to force the classic single-detector view.
+
    In the image window, drag the source and background circles into place, press **`e`** to extract the light curve (both detectors, shown as two subplots), then press **`e`** again to extract the spectra (both detectors), and **`x`** to open XSPEC with both loaded.
 
 ## Usage

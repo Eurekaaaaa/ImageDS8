@@ -4,12 +4,6 @@
 
 EP/FXT 交互式选源工具：拖动区域 → 取光变 → 取能谱 → 调起 XSPEC。
 
-当 FXT-A 与 FXT-B 的 cleaned 事例文件同时存在时，`ds8` 会在**同一窗口中并排显示两个探测器**。
-源/背景区域按天球坐标（FK5）在两个面板间共享——在任一面板拖动，另一面板同步移动。
-光变、能谱与 XSPEC 均对**两个探测器并行**处理（XSPEC 以 `data 1:1` 加载 FXT-A、
-`data 2:2` 加载 FXT-B，并分别载入各自的响应文件）。使用 `--detector a` 或 `--detector b`
-可强制回到单探测器视图。
-
 ```
 bin/  ds8  ds8_frame_plot.py  ds8_io_names.py  xspec_init  ds8-{fxt,wxt}.toml
 set_headas.sh   README.md   CN_README.md
@@ -82,6 +76,12 @@ source /path/to/set_headas.sh        # fxtsoft (HEASOFT) + CALDB
    ```bash
    ds8 .
    ```
+
+   当 FXT-A 与 FXT-B 的 cleaned 事例文件同时存在时，`ds8` 会在**同一窗口中并排显示两个探测器**。
+   源/背景区域按天球坐标（FK5）在两个面板间共享——在任一面板拖动，另一面板同步移动。
+   光变、能谱与 XSPEC 均对**两个探测器并行**处理（XSPEC 以 `data 1:1` 加载 FXT-A、
+   `data 2:2` 加载 FXT-B，并分别载入各自的响应文件）。使用 `--detector a` 或 `--detector b`
+   可强制回到单探测器视图。
 
    在图像窗口里拖动源圈、背景圈到位，按 **`e`** 取光变，再按一次 **`e`** 取能谱。
 
